@@ -2,7 +2,7 @@ name: deploy
 
 # Deploys any subset of the three services to the VPS over SSH.
 #
-# A service is touched only if its checkbox is ticked. Everything else keeps the tag it is
+# A service is touched only if you give it a tag. Everything else keeps the tag it is
 # already running: the workflow reads the current tags off the VPS and carries them forward,
 # so unselected services end up with a byte-identical `image:` line and Compose leaves their
 # containers alone.
@@ -14,28 +14,16 @@ name: deploy
 on:
   workflow_dispatch:
     inputs:
-      deploy_api:
-        description: 'Deploy API'
-        type: boolean
-        default: false
       api_tag:
-        description: 'API image tag (commit SHA) — required if Deploy API is ticked'
+        description: 'API image tag (commit SHA) — leave blank to leave the API untouched'
         type: string
         default: ''
-      deploy_ui:
-        description: 'Deploy UI'
-        type: boolean
-        default: false
       ui_tag:
-        description: 'UI image tag (commit SHA) — required if Deploy UI is ticked'
+        description: 'UI image tag (commit SHA) — leave blank to leave the UI untouched'
         type: string
         default: ''
-      deploy_auth:
-        description: 'Deploy Keycloak'
-        type: boolean
-        default: false
       auth_tag:
-        description: 'Keycloak image tag (commit SHA) — required if Deploy Keycloak is ticked'
+        description: 'Keycloak image tag (commit SHA) — leave blank to leave Keycloak untouched'
         type: string
         default: ''
       allow_secret_change:
@@ -71,16 +59,15 @@ jobs:
       # Everything that can be judged without touching the VPS is judged here, so a
       # malformed request never reaches production.
       #
-      # workflow_dispatch inputs cannot be conditionally required, so "tick the box and give
-      # me a tag" has to be enforced in code. All of it goes through `env:` rather than
-      # `${{ }}` inside the script: these inputs are free text from whoever pressed the
-      # button, and `${{ }}` substitutes *before* bash parses the line.
+      # The tag *is* the selection — there is no separate per-service checkbox, because
+      # workflow_dispatch renders a static form and cannot show or require one input based on
+      # another. A checkbox would therefore be a second field free to contradict the tag box
+      # next to it; one field per service cannot disagree with itself. All of this goes through
+      # `env:` rather than `${{ }}` inside the script: these inputs are free text from whoever
+      # pressed the button, and `${{ }}` substitutes *before* bash parses the line.
       - name: Validate inputs
         id: validate
         env:
-          DEPLOY_API: ${{ inputs.deploy_api }}
-          DEPLOY_UI: ${{ inputs.deploy_ui }}
-          DEPLOY_AUTH: ${{ inputs.deploy_auth }}
           API_TAG: ${{ inputs.api_tag }}
           UI_TAG: ${{ inputs.ui_tag }}
           AUTH_TAG: ${{ inputs.auth_tag }}
@@ -96,17 +83,13 @@ jobs:
 
           for svc in api ui auth; do
               upper=${svc^^}
-              flag_var="DEPLOY_${upper}"
               tag_var="${upper}_TAG"
-              flag=${!flag_var}
               tag=${!tag_var}
 
-              [[ $flag == true ]] || continue
+              # Blank means "leave this service alone", which is the whole selection mechanism.
+              [[ -n $tag ]] || continue
 
-              if [[ -z $tag ]]; then
-                  echo "::error::'$svc' is selected but no tag was given. Provide the commit SHA to deploy (the service repo's release run prints it as '${upper}_TAG=...')."
-                  fail=1
-              elif [[ ! $tag =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+              if [[ ! $tag =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
                   echo "::error::'$svc' tag is not a valid image tag. Allowed: letters, digits, dot, underscore, hyphen (max 128)."
                   fail=1
               else
@@ -115,7 +98,7 @@ jobs:
           done
 
           if (( fail == 0 )) && (( ${#services[@]} == 0 )); then
-              echo "::error::No service selected. Tick at least one of Deploy API / Deploy UI / Deploy Keycloak."
+              echo "::error::No service selected. Give the commit SHA of at least one service (the service repo's release run prints it as 'API_TAG=...', 'UI_TAG=...' or 'AUTH_TAG=...')."
               fail=1
           fi
 
@@ -205,7 +188,7 @@ jobs:
               if [[ " $SELECTED " == *" $svc "* ]]; then
                   resolved=${!input_var}
               elif [[ $env_exists == no ]]; then
-                  echo "::error::First deploy: no .env exists on the VPS yet, so all three tags must be supplied. '$svc' was left unticked."
+                  echo "::error::First deploy: no .env exists on the VPS yet, so all three tags must be supplied. '$svc' was left blank."
                   fail=1
                   continue
               else
@@ -214,7 +197,7 @@ jobs:
                   # would render `image: registry/ui:` and fail much later with an opaque
                   # "invalid reference format". Catch it here, where the cause is obvious.
                   if [[ ! $resolved =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
-                      echo "::error::Cannot carry forward ${upper}_TAG: the value in the VPS .env is missing or malformed. Fix it on the box, or tick '$svc' and supply a tag explicitly."
+                      echo "::error::Cannot carry forward ${upper}_TAG: the value in the VPS .env is missing or malformed. Fix it on the box, or supply a tag for '$svc' explicitly."
                       fail=1
                       continue
                   fi
