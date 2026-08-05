@@ -48,12 +48,12 @@ Rollback is editing those tags back and re-running `./deploy.sh`.
 ## Two things that will bite you
 
 **The issuer string.** The API validates JWTs by issuer alone, so
-`https://planelyx.com.br/auth/realms/planelyx` has to be identical from the browser and
+`https://planelyx.com/auth/realms/planelyx` has to be identical from the browser and
 from inside the API container. That is what `KC_HTTP_RELATIVE_PATH`, `KC_HOSTNAME`, and the
-`planelyx.com.br:host-gateway` entry on the `api` service are all for. Verify with:
+`planelyx.com:host-gateway` entry on the `api` service are all for. Verify with:
 
 ```bash
-curl -s https://planelyx.com.br/auth/realms/planelyx/.well-known/openid-configuration \
+curl -s https://planelyx.com/auth/realms/planelyx/.well-known/openid-configuration \
   | jq -r .issuer
 ```
 
