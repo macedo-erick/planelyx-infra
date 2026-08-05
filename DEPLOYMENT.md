@@ -622,13 +622,16 @@ Phases 1–7 stop at the image push. What was left was a human reading a SHA off
 SSHing in, editing one line of `.env`, and running `./deploy.sh` — the only manual step in the
 pipeline, and the one most able to go wrong quietly.
 
-`.github/workflows/deploy.yml` closes it. Six `workflow_dispatch` inputs: a checkbox and a tag
-box per service. Actions cannot make an input conditionally required, so "tick the box, give
-me a tag" is enforced in a validation step instead.
+`.github/workflows/deploy.yml` closes it. One `workflow_dispatch` tag box per service, and the
+tag *is* the selection: fill one in and that service is deployed, leave it blank and it is
+not. There are no per-service checkboxes, because `workflow_dispatch` renders a static form —
+an input cannot be shown or required based on another one — so a checkbox plus a tag box would
+have been two fields that can contradict each other, with the contradiction caught in a
+validation step rather than in the form. One field per service cannot disagree with itself.
 
 Four decisions carry the design.
 
-**An unticked service must not be touched — so its tag is carried forward, not blanked.** The
+**A service left blank must not be touched — so its tag is carried forward, not blanked.** The
 workflow renders the whole `.env` from repo secrets, which on its own would wipe the tags of
 services it wasn't asked to deploy. So it reads the current tags off the VPS first and reuses
 them. An untouched service ends up with a byte-identical `image:` line, Compose sees nothing

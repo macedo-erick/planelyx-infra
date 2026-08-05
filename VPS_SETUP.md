@@ -1046,8 +1046,8 @@ schema mismatch, so a healthy `api` is a real signal that the database is correc
 ## 13. The deploy workflow
 
 Everything up to here you did by hand, once. From now on releases go through
-`.github/workflows/deploy.yml` in `planelyx-infra`: you tick the services you want to deploy,
-paste their commit SHAs, and it SSHes in and does the rest. A service you don't tick is not
+`.github/workflows/deploy.yml` in `planelyx-infra`: you paste the commit SHA of each service
+you want to deploy, and it SSHes in and does the rest. A service you leave blank is not
 touched — the workflow reads its current tag off this box and carries it forward.
 
 Do this section after the stack is up and verified. The workflow is a convenience over a
@@ -1415,10 +1415,10 @@ user.
 1. Merge to `master`; wait for CI green in whichever repos changed.
 2. Note the commit SHA from the workflow's job summary (it prints
    `Deploy with API_TAG=<sha>`).
-3. In `planelyx-infra`: **Actions → deploy → Run workflow**. Tick the services you are
-   releasing and paste each one's SHA.
+3. In `planelyx-infra`: **Actions → deploy → Run workflow**. Paste the SHA of each service you
+   are releasing.
 
-Ticking nothing for a service is how you say "leave it alone" — the workflow reads that
+Leaving a service's tag box empty is how you say "leave it alone" — the workflow reads that
 service's current tag off this box and carries it forward, so its container is never
 recreated. There is no longer any reason to edit `.env` by hand.
 

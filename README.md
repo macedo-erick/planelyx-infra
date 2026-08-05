@@ -58,11 +58,11 @@ nginx and Postgres are installed on the host. The three containers publish only 
 
 ## Deploying
 
-Normally through the **deploy** action in this repo (Actions → deploy → Run workflow). Tick
-the services you want to release and paste each one's commit SHA — the service's release run
-prints it as `Deploy with API_TAG=<sha>`. **A service you don't tick is not touched at all**:
-the workflow reads its current tag off the VPS and carries it forward, so its container is
-left running exactly as it was.
+Normally through the **deploy** action in this repo (Actions → deploy → Run workflow). Paste
+the commit SHA of each service you want to release — the service's release run prints it as
+`Deploy with API_TAG=<sha>`. **A service you leave blank is not touched at all**: the workflow
+reads its current tag off the VPS and carries it forward, so its container is left running
+exactly as it was.
 
 Rollback is the same workflow with the previous SHA. The previous tags are in the prior run's
 job summary, and in `.env.prev` on the VPS.
