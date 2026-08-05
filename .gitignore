@@ -1,0 +1,5 @@
+.env
+*.json.key
+sa-key.json
+.idea/
+.vscode/
