@@ -16,24 +16,30 @@ on the host; everything else in Compose bound to `127.0.0.1`; one Postgres serve
 databases (`planelyx`, `keycloak`); a custom Keycloak image in its own repo carrying the
 realm export and login theme.
 
-## Checklist
+## What's built vs. what you run
 
-Phases 1–4 and 6–7 are **implemented and verified locally**. Phase 5 and the cutover are
-yours to run on the VPS.
+The work splits in two. Phases 1–4 and 6–7 are committed code — written, built, and verified
+locally, so they travel with the repositories. Phase 5 and the cutover are host actions: they
+touch a specific machine's packages, firewall, database, and DNS, so they can only happen on
+the VPS itself and are steps you run rather than code you ship.
+
+**Committed and verified:**
 
 - [x] **Phase 1** — `planelyx-auth` (Keycloak image) — built, booted, realm imported
 - [x] **Phase 2** — `planelyx-ui`: base-href-aware auth redirects, Dockerfile, nginx
 - [x] **Phase 3** — `planelyx-api`: proxy headers, health endpoint, hardened prod image
 - [x] **Phase 4** — CI workflows → Artifact Registry (needs GCP secrets set)
-- [ ] **Phase 5** — VPS host setup (packages, firewall, Postgres, DNS, TLS)
 - [x] **Phase 6** — nginx site config — `nginx -t` clean
 - [x] **Phase 7** — `planelyx-infra` (`compose.prod.yaml`, `deploy.sh`)
-- [ ] **Cutover** — in order; Keycloak's first boot is the one that imports the realm
-- [ ] **Verify** — issuer string first, then browser end-to-end
 
-Before the first deploy you must still: create the two new git repos and push, set the GCP
-secrets (`GCP_SA_KEY`, `GCP_PROJECT_ID`) in all three repos, and
-create the Artifact Registry repository itself.
+**Run on the host, in this order:**
+
+1. **Phase 5** — VPS host setup (packages, firewall, Postgres, DNS, TLS) — see `VPS_SETUP.md`
+2. **Cutover** — order matters; Keycloak's first boot is the one that imports the realm
+3. **Verify** — issuer string first, then browser end-to-end
+
+Before the first deploy you must also set the GCP secrets (`GCP_SA_KEY`, `GCP_PROJECT_ID`) in
+all three service repos, and create the Artifact Registry repository itself.
 
 ---
 
@@ -354,8 +360,10 @@ Two build-hygiene items while you're here:
 One workflow per repo — `.github/workflows/release.yml`, triggered on push to `master` and on
 tags.
 
-**Registry:** `southamerica-east1-docker.pkg.dev/<PROJECT_ID>/planelyx/{api,ui,auth}` — São
-Paulo keeps pulls fast if the VPS is in Brazil.
+**Registry:** `southamerica-east1-docker.pkg.dev/<PROJECT_ID>/docker-remote-repo/{api,ui,auth}`
+— São Paulo keeps pulls fast if the VPS is in Brazil. The `docker-remote-repo` segment is
+`REPOSITORY` in all three `release.yml` workflows and must match `REGISTRY` in `.env`; point
+one somewhere else and `deploy.sh` pulls from a path CI never wrote to.
 
 **Auth:** a service-account JSON key in `GCP_SA_KEY` — `google-github-actions/auth` with
 `credentials_json`, then `gcloud auth configure-docker southamerica-east1-docker.pkg.dev`.

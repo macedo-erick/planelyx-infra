@@ -1,10 +1,33 @@
 # planelyx-infra
 
-Everything that lives on the VPS: the production Compose stack, the host nginx config, and
-the deploy script. Clone this to the VPS; it builds nothing.
+Planelyx is a personal-finance application. It is split across four repositories — a Spring
+Boot API, an Angular SPA, a Keycloak image carrying the realm and login theme, and this one,
+which is the deployment layer. Everything that lives on the VPS is here: the production
+Compose stack, the host nginx config, and the deploy script. Clone this to the VPS; it builds
+nothing.
 
-The full runbook — VPS packages, Postgres roles, DNS, TLS, cutover order, verification —
-is `DEPLOYMENT.md` in `planelyx-api`.
+The whole system runs on a single VPS. GitHub Actions builds each service and pushes it to
+GCP Artifact Registry; the VPS pulls those images into a Compose stack that sits behind a
+host-installed nginx, with all three services routed by path under one hostname.
+
+```
+planelyx-api    Spring Boot, JWT resource server        ->  /api/
+planelyx-ui     Angular SPA served by nginx             ->  /ui/
+planelyx-auth   Keycloak image (realm + login theme)    ->  /auth/
+planelyx-infra  this repo — Compose, nginx, deploy.sh
+```
+
+## Start here
+
+Two documents carry the real content:
+
+- **`VPS_SETUP.md`** — building the host from a bare Ubuntu install: users, SSH hardening,
+  firewall, Postgres roles and `pg_hba.conf`, DNS, TLS.
+- **`DEPLOYMENT.md`** — the deployment runbook: the issuer-string constraint the whole auth
+  setup turns on, CI wiring, cutover order, and verification.
+
+Both are written as runbooks rather than overviews — they record the failure modes that cost
+real time, not just the happy path.
 
 ## Layout
 
