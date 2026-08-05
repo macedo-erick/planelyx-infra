@@ -49,6 +49,19 @@ services:
       POSTGRES_PASSWORD: ${APP_DB_PASSWORD}
       # Must match the realm's issuer byte for byte, including the /auth prefix.
       KEYCLOAK_ISSUER_URI: https://planelyx.com/auth/realms/planelyx
+      # The other direction: the API calling Keycloak's Admin API to read and update the
+      # signed-in user's own profile (/me). Deliberately *not* the public issuer URL — no
+      # claim is matched here, so this goes over the compose network and skips the nginx
+      # hairpin. The /auth suffix is required: KC_HTTP_RELATIVE_PATH=/auth is baked into the
+      # auth image, and Spring appends request paths onto this base rather than replacing it.
+      KEYCLOAK_SERVER_URL: http://auth:8080/auth
+      KEYCLOAK_REALM: planelyx
+      KEYCLOAK_ADMIN_CLIENT_ID: planelyx-api-admin
+      # Secret of the confidential planelyx-api-admin client, taken from the admin console.
+      # Guarded because an unset variable renders as empty, and Keycloak answers an empty
+      # secret with the same invalid_client 401 as a wrong one — indistinguishable from a
+      # genuinely bad credential, and a long way from the real cause.
+      KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:?KEYCLOAK_ADMIN_CLIENT_SECRET is not set}
       # Same-origin in production so CORS never fires, but a correct value costs nothing.
       PLANELYX_CORS_ORIGINS: https://planelyx.com
     # Healthcheck is defined in the API image itself (curl /actuator/health).
@@ -83,6 +96,13 @@ services:
       # Realm-import substitutions; resolved only on the very first boot.
       PLANELYX_UI_ORIGIN: https://planelyx.com
       PLANELYX_UI_BASE_URL: https://planelyx.com/ui
+      # Seeds the planelyx-api-admin client secret in planelyx-auth's realm export. The live
+      # realm already exists, so this changes nothing today — it matters on a rebuilt realm,
+      # where leaving it unset would not skip the client but create it with the export's
+      # `local-dev-secret` fallback: a publicly known credential holding manage-users here.
+      # Same value the api service receives as KEYCLOAK_ADMIN_CLIENT_SECRET; one .env key
+      # feeds both sides so the secret Keycloak stores and the one the API sends cannot drift.
+      PLANELYX_KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:?KEYCLOAK_ADMIN_CLIENT_SECRET is not set}
     healthcheck:
       test:
         [
