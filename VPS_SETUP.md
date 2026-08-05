@@ -32,9 +32,10 @@ the ordering and the traps are the same everywhere.
 10. [TLS with Let's Encrypt](#10-tls-with-lets-encrypt)
 11. [Artifact Registry access](#11-artifact-registry-access)
 12. [Bringing up the stack](#12-bringing-up-the-stack)
-13. [Verification](#13-verification)
-14. [Operations](#14-operations) — logs, SQL client access, backups, deploys, rollback
-15. [Troubleshooting](#15-troubleshooting)
+13. [The deploy workflow](#13-the-deploy-workflow) — SSH key and repo secrets for CD
+14. [Verification](#14-verification)
+15. [Operations](#15-operations) — logs, SQL client access, backups, deploys, rollback
+16. [Troubleshooting](#16-troubleshooting)
 
 ---
 
@@ -209,7 +210,7 @@ $ sudo apt-get update && sudo apt-get install -y unattended-upgrades
 $ sudo dpkg-reconfigure --priority=low unattended-upgrades
 ```
 
-This patches the OS, not your containers. Image updates are your job ([§14](#14-operations)).
+This patches the OS, not your containers. Image updates are your job ([§15](#15-operations)).
 
 ### Time
 
@@ -269,7 +270,7 @@ $ sudo ufw reload
 
 Scoped to the Compose subnet, so 5432 stays closed to everything else. Skip this and `auth`
 fails to start with a **timeout** — never a refusal, never an authentication error, because
-the packets are silently discarded rather than answered. See [§15](#15-troubleshooting) for
+the packets are silently discarded rather than answered. See [§16](#16-troubleshooting) for
 how to tell those apart, and keep the rule's subnet in step with the `ipam` block in
 `compose.prod.yaml`.
 
@@ -343,7 +344,7 @@ $ sudo apt-get update
 $ sudo apt-get install -y ca-certificates curl gnupg lsb-release jq unzip
 ```
 
-`jq` is used throughout [§13](#13-verification); install it now so verification is not
+`jq` is used throughout [§14](#14-verification); install it now so verification is not
 blocked on it.
 
 ### Docker CE (official repository)
@@ -489,7 +490,7 @@ meaningless without the matching user in `keycloak`.
 
 Back them up **in the same job**, restore them **together**, and never restore one from a
 different point in time than the other. A partial restore is a data-loss event that will
-present as users logging in to an empty account. See [§14](#14-operations).
+present as users logging in to an empty account. See [§15](#15-operations).
 
 ### Letting the containers connect
 
@@ -961,7 +962,7 @@ WARN[0000] The "jiBybu6hWhVy6V4" variable is not set. Defaulting to a blank stri
 
 Treat that warning as a hard error. It means a credential silently reached a container
 truncated, and the failure surfaces much later as an unrelated-looking connection timeout
-(see [§15](#15-troubleshooting)).
+(see [§16](#16-troubleshooting)).
 
 `openssl rand -base64 32` never emits `$` — that is the reason [§7](#7-postgresql)
 recommends it. If a password manager produced one that has a `$`, all three of these
@@ -1042,7 +1043,109 @@ schema mismatch, so a healthy `api` is a real signal that the database is correc
 
 ---
 
-## 13. Verification
+## 13. The deploy workflow
+
+Everything up to here you did by hand, once. From now on releases go through
+`.github/workflows/deploy.yml` in `planelyx-infra`: you tick the services you want to deploy,
+paste their commit SHAs, and it SSHes in and does the rest. A service you don't tick is not
+touched — the workflow reads its current tag off this box and carries it forward.
+
+Do this section after the stack is up and verified. The workflow is a convenience over a
+process you have already proven manually; wiring it before you know the manual path works
+just gives you two things to debug at once.
+
+### A dedicated SSH key
+
+Generate it on your workstation, not on the VPS — the private half never needs to exist there.
+
+```bash
+$ ssh-keygen -t ed25519 -C github-actions-deploy -f ~/.ssh/planelyx-deploy -N ''
+```
+
+Append the public half to the `deploy` user's `authorized_keys`:
+
+```bash
+$ ssh-copy-id -i ~/.ssh/planelyx-deploy.pub deploy@planelyx.com
+```
+
+Use a fresh key rather than the one you log in with. Revoking CI access then means deleting
+one line from `authorized_keys`, with no effect on your own access.
+
+Capture the host key for pinning — this is what makes `StrictHostKeyChecking=yes` in the
+workflow mean anything:
+
+```bash
+$ ssh-keyscan planelyx.com
+```
+
+> Take that output from a network you trust. `ssh-keyscan` has no way to authenticate what
+> answers it, so scanning from a compromised network pins an attacker's key.
+
+Confirm the key works **non-interactively**, which is how Actions will use it:
+
+```bash
+$ ssh -i ~/.ssh/planelyx-deploy -o BatchMode=yes deploy@planelyx.com \
+    'cd planelyx-infra && ./deploy.sh --print-interface && docker compose version'
+```
+
+Three things this proves at once: the key is accepted without a passphrase prompt, the VPS
+checkout is new enough (it must print `v2`), and Docker is reachable as `deploy` without a
+login shell. Also check the registry credential the same way — a `docker login -u _json_key`
+blob works fine here, but a `gcloud` credential helper needs `gcloud` on the non-interactive
+`PATH` and will fail even though it works when you are logged in:
+
+```bash
+$ ssh -i ~/.ssh/planelyx-deploy -o BatchMode=yes deploy@planelyx.com \
+    'docker pull southamerica-east1-docker.pkg.dev/PROJECT_ID/docker-remote-repo/ui:latest'
+```
+
+### Repo secrets
+
+In `planelyx-infra` → Settings → Secrets and variables → Actions:
+
+| Secret | Value |
+|---|---|
+| `VPS_HOST` | `planelyx.com`, or the IP |
+| `VPS_USER` | `deploy` |
+| `VPS_SSH_KEY` | contents of `~/.ssh/planelyx-deploy` (the private half) |
+| `VPS_SSH_KNOWN_HOSTS` | the `ssh-keyscan` output above |
+| `GCP_PROJECT_ID` | same value as in the three service repos |
+| `APP_DB_PASSWORD` | the `planelyx_app` role's password, from [§7](#7-postgresql) |
+| `KC_DB_PASSWORD` | the `keycloak` role's password |
+| `KC_ADMIN` | Keycloak bootstrap admin username |
+| `KC_ADMIN_PASSWORD` | Keycloak bootstrap admin password |
+
+The last four must **byte-match what is in `.env` on the box right now**. The workflow
+compares them before it deploys and refuses to continue if they differ, precisely so a
+mismatch surfaces here rather than weeks later, when an unrelated deploy recreates a container
+with a password Postgres rejects.
+
+No `GCP_SA_KEY` is needed. The VPS already holds its own read-only registry login from
+[§11](#11-artifact-registry-access), and the runner never touches the registry.
+
+### What the workflow now owns
+
+`.env` on the VPS is rendered from those secrets on **every** deploy. That makes GitHub the
+source of truth for those four credentials — see the warning in
+[§15](#15-operations) about what that means for rotation.
+
+The workflow does *not* update the VPS's checkout of this repo. It checks that `deploy.sh` is
+current and stops if it isn't, but pulling is left to you:
+
+```bash
+$ git -C ~/planelyx-infra pull --ff-only
+```
+
+Deploying container images and changing checked-out infra code are different operations, and
+a release is the wrong moment to silently do both. Anything touching `compose.prod.yaml` or
+the nginx configs is still a manual, deliberate step.
+
+> `workflow_dispatch` only appears in the Actions tab once the workflow file is on the default
+> branch. If you cannot find the "Run workflow" button, the file is still on a feature branch.
+
+---
+
+## 14. Verification
 
 Run these in order. The ordering is deliberate: each one narrows down where a failure can
 be, and the issuer check catches the single most likely mistake.
@@ -1177,7 +1280,7 @@ $ nmap -Pn -p 22,80,443,5432,8081,8082,8083 <VPS public IP>
 
 ---
 
-## 14. Operations
+## 15. Operations
 
 ### Logs
 
@@ -1312,8 +1415,27 @@ user.
 1. Merge to `master`; wait for CI green in whichever repos changed.
 2. Note the commit SHA from the workflow's job summary (it prints
    `Deploy with API_TAG=<sha>`).
-3. On the VPS, edit the relevant `*_TAG` line in `.env`.
-4. `./deploy.sh`
+3. In `planelyx-infra`: **Actions → deploy → Run workflow**. Tick the services you are
+   releasing and paste each one's SHA.
+
+Ticking nothing for a service is how you say "leave it alone" — the workflow reads that
+service's current tag off this box and carries it forward, so its container is never
+recreated. There is no longer any reason to edit `.env` by hand.
+
+The workflow refuses to deploy if a tag doesn't exist in Artifact Registry, and it finds that
+out *before* replacing `.env`, so a mistyped SHA costs a red run and nothing else.
+
+You still need the SSH access and repo secrets from [§13](#13-the-deploy-workflow) in place.
+
+**`.env` is now rendered from the repo secrets on every deploy.** Editing a credential here
+without updating the secret will be reverted on the next run — and because the workflow
+compares the two first, it will fail loudly rather than silently reverting. That check is the
+point; do not work around it by disabling it. Rotate properly: change the Postgres role,
+update the repo secret, then run the workflow with *Allow DB/Keycloak credentials to differ*
+ticked.
+
+`./deploy.sh` still works on the box for manual and break-glass use, and now takes an optional
+service list (`./deploy.sh api` touches only the API). It reads the same `.env`.
 
 Not zero-downtime: `up -d` restarts the API in place and Flyway runs on startup, so expect
 a few seconds of `502` on `/api`. Fine at this scale; revisit when it stops being fine.
@@ -1324,8 +1446,12 @@ different build, not a different env var.
 
 ### Rolling back
 
-Edit the `*_TAG` values in `.env` back to the previous SHAs and re-run `./deploy.sh`. This
-is why you pinned SHAs.
+Re-run the deploy workflow with the previous SHAs. This is why you pinned SHAs.
+
+Where to find them: the previous run's job summary lists every service's tag, and `.env.prev`
+on the VPS holds the tags from immediately before the last deploy. The old images are still on
+the box — `deploy.sh` prunes only *dangling* images, and a pinned SHA tag is never dangling —
+so a rollback doesn't even need the registry.
 
 The caveat: **Flyway migrations do not roll back.** If the release you are reverting added a
 migration, the old image will start against a newer schema and `ddl-auto: validate` may
@@ -1358,12 +1484,12 @@ $ sudo reboot        # when the kernel changed
 
 ---
 
-## 15. Troubleshooting
+## 16. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | **Every authenticated request 401s**, unauthenticated ones work | Issuer mismatch. The `iss` claim does not equal `KEYCLOAK_ISSUER_URI` character for character. | Compare `curl .../.well-known/openid-configuration \| jq -r .issuer` with `KEYCLOAK_ISSUER_URI` in `compose.prod.yaml`. Watch for a trailing slash, a missing `/auth`, or `http` vs `https`. |
-| **API healthy but 401s**, issuer strings match | API cannot reach the issuer to fetch JWKS. | Run [§13 check 3](#3-the-host-gateway-hairpin). Missing `'planelyx.com:host-gateway'` in `extra_hosts`, or the container cannot reach host nginx on 443. |
+| **API healthy but 401s**, issuer strings match | API cannot reach the issuer to fetch JWKS. | Run [§14 check 3](#3-the-host-gateway-hairpin). Missing `'planelyx.com:host-gateway'` in `extra_hosts`, or the container cannot reach host nginx on 443. |
 | **`auth` container exits with code 2** on start, log mentions "build time options have values that differ" | A build-time Keycloak option was overridden at runtime. `KC_DB`, `KC_HEALTH_ENABLED`, `KC_HTTP_RELATIVE_PATH` and `KC_HTTP_MANAGEMENT_RELATIVE_PATH` are baked into the image; `start --optimized` treats a differing runtime value as fatal, not a warning. | Remove the offending variable from `compose.prod.yaml`. To actually change it, edit `planelyx-auth/Dockerfile` and rebuild. |
 | **`auth` never becomes healthy**, but the log looks fine | The health probe moved. If `KC_HTTP_MANAGEMENT_RELATIVE_PATH` is not pinned to `/`, the management interface inherits `/auth` and health lands at `:9000/auth/health/ready`. | Confirm the Dockerfile bakes `KC_HTTP_MANAGEMENT_RELATIVE_PATH=/`. |
 | **Compose warns** `The "xxxxx" variable is not set. Defaulting to a blank string` | A value in `.env` contains a literal `$`, which Compose interpolated away. A credential reached the container truncated at the `$`. | Wrap the value in single quotes (or escape as `$$`), then verify with `docker compose run --rm auth printenv KC_DB_PASSWORD` — **not** `docker compose config`, which re-escapes `$`. See [§12](#12-bringing-up-the-stack). |

@@ -1,4 +1,8 @@
+# `.env` alone is an exact match — it would not cover the `.env.staged` the deploy workflow
+# writes, nor the `.env.prev` it keeps as the previous release's tags.
 .env
+.env.*
+!.env.example
 *.json.key
 sa-key.json
 .idea/

@@ -31,6 +31,8 @@ the VPS itself and are steps you run rather than code you ship.
 - [x] **Phase 4** — CI workflows → Artifact Registry (needs GCP secrets set)
 - [x] **Phase 6** — nginx site config — `nginx -t` clean
 - [x] **Phase 7** — `planelyx-infra` (`compose.prod.yaml`, `deploy.sh`)
+- [x] **Phase 8** — `planelyx-infra` deploy workflow — SSH-driven, per-service (needs the VPS
+      secrets set; see `VPS_SETUP.md` §13)
 
 **Run on the host, in this order:**
 
@@ -39,7 +41,10 @@ the VPS itself and are steps you run rather than code you ship.
 3. **Verify** — issuer string first, then browser end-to-end
 
 Before the first deploy you must also set the GCP secrets (`GCP_SA_KEY`, `GCP_PROJECT_ID`) in
-all three service repos, and create the Artifact Registry repository itself.
+all three service repos, and create the Artifact Registry repository itself. Phase 8's
+workflow needs its own secrets in `planelyx-infra` — SSH access plus the DB and Keycloak
+credentials — but that can wait until the stack is up and verified by hand; see
+`VPS_SETUP.md` §13.
 
 ---
 
@@ -68,7 +73,7 @@ Two new repos join the existing two:
 | `planelyx-api` (exists) | Spring Boot | image `api` |
 | `planelyx-ui` (exists) | Angular | image `ui` (nginx + static) |
 | `planelyx-auth` (**new**) | Keycloak Dockerfile, `realm-export.json`, `themes/planelyx/` | image `auth` |
-| `planelyx-infra` (**new**) | `compose.prod.yaml`, nginx site config, `.env.example`, `deploy.sh` | nothing — cloned onto the VPS |
+| `planelyx-infra` (**new**) | `compose.prod.yaml`, nginx site config, `.env.example`, `deploy.sh`, `deploy.yml` | no image — cloned onto the VPS, and runs the deploy |
 
 `planelyx-auth` takes over `planelyx-api/docker/keycloak/` (both the realm export and the
 theme). The API repo's `docker/` directory keeps only `postgres/init-keycloak-db.sql` for
@@ -607,6 +612,68 @@ docker compose -f compose.prod.yaml up -d --remove-orphans
 docker image prune -f
 ```
 
+Since Phase 8 it also takes an optional service list and gates on health — see below.
+
+---
+
+## Phase 8 — the deploy workflow
+
+Phases 1–7 stop at the image push. What was left was a human reading a SHA off a job summary,
+SSHing in, editing one line of `.env`, and running `./deploy.sh` — the only manual step in the
+pipeline, and the one most able to go wrong quietly.
+
+`.github/workflows/deploy.yml` closes it. Six `workflow_dispatch` inputs: a checkbox and a tag
+box per service. Actions cannot make an input conditionally required, so "tick the box, give
+me a tag" is enforced in a validation step instead.
+
+Four decisions carry the design.
+
+**An unticked service must not be touched — so its tag is carried forward, not blanked.** The
+workflow renders the whole `.env` from repo secrets, which on its own would wipe the tags of
+services it wasn't asked to deploy. So it reads the current tags off the VPS first and reuses
+them. An untouched service ends up with a byte-identical `image:` line, Compose sees nothing
+to do, and `--no-deps` keeps it out of the operation entirely.
+
+Carried-forward values are re-validated rather than trusted, because **Compose treats an
+unresolved variable as a warning, not an error**: a blank would render `image: registry/ui:`
+and survive `config`, only to fail at the daemon with `invalid reference format`. The compose
+file now also uses `${UI_TAG:?UI_TAG is not set}` so that class of mistake stops at
+interpolation, next to its cause.
+
+**A wrong tag must not reach production.** The rendered file is written to `.env.staged`, and
+`docker compose --env-file .env.staged pull` runs *before* anything is promoted. That is what
+proves the tag exists in Artifact Registry. Only on success does `mv .env.staged .env` happen.
+A mistyped SHA therefore costs a red run and nothing else — `.env` unchanged, no container
+recreated. (It proves the manifest exists, not that the image runs. It is a filter on the
+common mistake, not a safety net.)
+
+**Deploying a subset needs two Compose behaviours that are easy to get backwards.** An empty
+service list means *all services*, so "deploy nothing" would silently mean "deploy
+everything" — guarded in the workflow and again in `deploy.sh`. And `--no-deps` drops
+dependency edges outright, not merely to services outside the selection: `up --no-deps ui api
+auth` would start `api` without waiting for `auth` to be healthy, and the API resolves the
+OIDC metadata at startup. So selecting all three deliberately takes the whole-stack path.
+
+**Credentials in GitHub means drift is an outage waiting.** Sourcing `.env` from repo secrets
+was a deliberate choice, and its sharp edge is deferred failure: if `APP_DB_PASSWORD` there
+doesn't match the live Postgres role, deploying only `ui` rewrites `.env` harmlessly, and an
+unrelated `api` deploy weeks later recreates the container with a password Postgres rejects.
+So the workflow compares the four credentials against the VPS before staging and refuses to
+continue if they differ, unless you tell it you are rotating. It never prints either value.
+
+The `$`-truncation trap documented in `.env.example` is now the workflow's problem too, and
+the fix is the same one that file recommends: render every credential single-quoted. Compose's
+dotenv parser is not a shell, so single quotes admit no escape at all and a value containing
+`'` is simply unrepresentable — the workflow rejects such a secret rather than mangling it.
+
+`deploy.sh` gained the other half: an optional service list, and `up -d --wait
+--wait-timeout 300`, which exits non-zero unless everything it touched reaches
+`running|healthy`. It previously ended on `docker compose ps` and returned 0 regardless, so a
+container in a restart loop read as a successful deploy. 300s is a floor, not a guess —
+`auth`'s healthcheck alone allows 45s + 20×10s. `ui` declares no healthcheck, so `--wait`
+settles for `running` there; the script re-checks its restart counter after a dwell, which is
+the only signal separating "started" from "crash-looping".
+
 ---
 
 ## Cutover order
@@ -748,3 +815,10 @@ databases live on the host, so nothing should be lost.
 - **Zero-downtime deploys** are out of scope: `up -d` restarts the API in place and Flyway
   runs on startup, so expect a few seconds of 502. Fine for now; revisit when it stops being
   fine.
+- **Image disk usage grows monotonically.** Every deploy pins a fresh SHA tag and old SHA tags
+  are never removed, so the `docker image prune -f` in `deploy.sh` reclaims almost nothing —
+  it only touches *dangling* images. That is exactly right for rollback (the previous image
+  keeps its tag and stays local, so reverting needs no registry round trip), and it is why
+  `-a` must never be added: `prune -a` deletes precisely the images you would roll back to.
+  The fix is a bounded retention pass on a timer — keep the N most recent tags per repo —
+  outside the deploy path. Until then, watch `docker system df`.

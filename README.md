@@ -33,8 +33,9 @@ real time, not just the happy path.
 
 ```
 compose.prod.yaml            ui / api / auth, all bound to 127.0.0.1
-deploy.sh                    pull + up -d + prune
-.env.example                 copy to .env, chmod 600
+deploy.sh                    pull + up -d + health gate + prune; takes an optional service list
+.github/workflows/deploy.yml manual deploy over SSH; renders .env from repo secrets
+.env.example                 copy to .env, chmod 600 (workflow-managed after the first deploy)
 nginx/planelyx.conf          -> /etc/nginx/sites-available/planelyx
 nginx/snippets/planelyx-proxy.conf -> /etc/nginx/snippets/
 ```
@@ -57,16 +58,33 @@ nginx and Postgres are installed on the host. The three containers publish only 
 
 ## Deploying
 
+Normally through the **deploy** action in this repo (Actions → deploy → Run workflow). Tick
+the services you want to release and paste each one's commit SHA — the service's release run
+prints it as `Deploy with API_TAG=<sha>`. **A service you don't tick is not touched at all**:
+the workflow reads its current tag off the VPS and carries it forward, so its container is
+left running exactly as it was.
+
+Rollback is the same workflow with the previous SHA. The previous tags are in the prior run's
+job summary, and in `.env.prev` on the VPS.
+
+The workflow renders `.env` from this repo's secrets on every run, so **GitHub is the source
+of truth for the DB and Keycloak credentials** — a value hand-edited on the box is reverted on
+the next deploy. It refuses to deploy if the two disagree, unless you tell it you are
+rotating.
+
+`deploy.sh` remains the manual and break-glass path, and now takes an optional service list:
+
 ```bash
-# once
+# once, on the VPS
 cat sa-key.json | docker login -u _json_key --password-stdin \
   https://southamerica-east1-docker.pkg.dev
 
-# every release: bump the *_TAG values in .env to the new commit SHAs, then
-./deploy.sh
+./deploy.sh              # whole stack
+./deploy.sh api          # only the api container; ui and auth keep running
 ```
 
-Rollback is editing those tags back and re-running `./deploy.sh`.
+Either way the tags come from `.env`. Editing them by hand and running `./deploy.sh` still
+works — just expect the next workflow run to reconcile the file against the repo secrets.
 
 ## Two things that will bite you
 

@@ -1,0 +1,420 @@
+name: deploy
+
+# Deploys any subset of the three services to the VPS over SSH.
+#
+# A service is touched only if its checkbox is ticked. Everything else keeps the tag it is
+# already running: the workflow reads the current tags off the VPS and carries them forward,
+# so unselected services end up with a byte-identical `image:` line and Compose leaves their
+# containers alone.
+#
+# `.env` on the VPS is rendered from the secrets below on every run. That makes GitHub the
+# source of truth for those credentials — a value hand-edited on the box is reverted by the
+# next deploy. The drift check exists so that reversion can never happen silently.
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_api:
+        description: 'Deploy API'
+        type: boolean
+        default: false
+      api_tag:
+        description: 'API image tag (commit SHA) — required if Deploy API is ticked'
+        type: string
+        default: ''
+      deploy_ui:
+        description: 'Deploy UI'
+        type: boolean
+        default: false
+      ui_tag:
+        description: 'UI image tag (commit SHA) — required if Deploy UI is ticked'
+        type: string
+        default: ''
+      deploy_auth:
+        description: 'Deploy Keycloak'
+        type: boolean
+        default: false
+      auth_tag:
+        description: 'Keycloak image tag (commit SHA) — required if Deploy Keycloak is ticked'
+        type: string
+        default: ''
+      allow_secret_change:
+        description: 'Allow DB/Keycloak credentials to differ from the VPS (credential rotation)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Two deploys interleaving would race on a single `.env`. Never cancel one in flight: the
+# dangerous moment is between `mv .env.staged .env` and the end of `up -d`.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  # Mirrors the three service repos' release.yml, which push to this same path.
+  REGION: southamerica-east1
+  REPOSITORY: docker-remote-repo
+  VPS_PATH: planelyx-infra
+  PUBLIC_URL: https://planelyx.com
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    # A hung SSH would otherwise sit on the 6-hour default.
+    timeout-minutes: 15
+
+    steps:
+      # ---------------------------------------------------------------- validate ----
+      # Everything that can be judged without touching the VPS is judged here, so a
+      # malformed request never reaches production.
+      #
+      # workflow_dispatch inputs cannot be conditionally required, so "tick the box and give
+      # me a tag" has to be enforced in code. All of it goes through `env:` rather than
+      # `${{ }}` inside the script: these inputs are free text from whoever pressed the
+      # button, and `${{ }}` substitutes *before* bash parses the line.
+      - name: Validate inputs
+        id: validate
+        env:
+          DEPLOY_API: ${{ inputs.deploy_api }}
+          DEPLOY_UI: ${{ inputs.deploy_ui }}
+          DEPLOY_AUTH: ${{ inputs.deploy_auth }}
+          API_TAG: ${{ inputs.api_tag }}
+          UI_TAG: ${{ inputs.ui_tag }}
+          AUTH_TAG: ${{ inputs.auth_tag }}
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          APP_DB_PASSWORD: ${{ secrets.APP_DB_PASSWORD }}
+          KC_DB_PASSWORD: ${{ secrets.KC_DB_PASSWORD }}
+          KC_ADMIN: ${{ secrets.KC_ADMIN }}
+          KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          fail=0
+          services=()
+
+          for svc in api ui auth; do
+              upper=${svc^^}
+              flag_var="DEPLOY_${upper}"
+              tag_var="${upper}_TAG"
+              flag=${!flag_var}
+              tag=${!tag_var}
+
+              [[ $flag == true ]] || continue
+
+              if [[ -z $tag ]]; then
+                  echo "::error::'$svc' is selected but no tag was given. Provide the commit SHA to deploy (the service repo's release run prints it as '${upper}_TAG=...')."
+                  fail=1
+              elif [[ ! $tag =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+                  echo "::error::'$svc' tag is not a valid image tag. Allowed: letters, digits, dot, underscore, hyphen (max 128)."
+                  fail=1
+              else
+                  services+=("$svc")
+              fi
+          done
+
+          if (( fail == 0 )) && (( ${#services[@]} == 0 )); then
+              echo "::error::No service selected. Tick at least one of Deploy API / Deploy UI / Deploy Keycloak."
+              fail=1
+          fi
+
+          # Compose's dotenv parser is not a shell: inside single quotes it has no escape
+          # sequence at all, so a value containing ' simply cannot be represented. Values are
+          # rendered single-quoted because that is the only form Compose leaves un-interpolated
+          # (see the $-truncation warning in .env.example), so this is a hard constraint rather
+          # than a style rule. `openssl rand -base64 32` never emits ' or $.
+          for name in GCP_PROJECT_ID APP_DB_PASSWORD KC_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD; do
+              value=${!name}
+              if [[ -z $value ]]; then
+                  echo "::error::Repo secret $name is empty or not set."
+                  fail=1
+              elif [[ $value == *"'"* ]]; then
+                  echo "::error::Repo secret $name contains a single quote, which cannot be represented in a Compose .env value. Regenerate it without one."
+                  fail=1
+              fi
+          done
+
+          (( fail == 0 )) || exit 1
+
+          echo "services=${services[*]}" >> "$GITHUB_OUTPUT"
+          echo "Selected: ${services[*]}"
+
+      # -------------------------------------------------------------------- ssh ----
+      # Plain openssh rather than a marketplace action: nothing third-party then handles the
+      # deploy key. StrictHostKeyChecking is only meaningful because known_hosts is pinned
+      # from a secret.
+      - name: Configure SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          umask 077
+          # The trailing newline is required — openssh rejects a key file without one as
+          # "invalid format", which reads like a corrupt key rather than a missing byte.
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" > ~/.ssh/deploy_known_hosts
+
+          {
+              echo "SSH_OPTS=-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/deploy_known_hosts -i $HOME/.ssh/deploy_key"
+              echo "REMOTE=$VPS_USER@$VPS_HOST"
+          } >> "$GITHUB_ENV"
+
+      # A stale checkout is the one failure that would be invisible: the previous deploy.sh
+      # ignored extra arguments, so `./deploy.sh api` on an un-pulled VPS would quietly
+      # redeploy all three services from the .env this workflow just rewrote.
+      - name: Check the VPS checkout is current
+        run: |
+          set -euo pipefail
+          ssh $SSH_OPTS "$REMOTE" true
+
+          interface=$(ssh $SSH_OPTS "$REMOTE" "cd '$VPS_PATH' && ./deploy.sh --print-interface" 2>/dev/null) || interface=""
+          if [[ $interface != v2 ]]; then
+              echo "::error::The VPS checkout of planelyx-infra is out of date (deploy.sh interface: '${interface:-none}', expected 'v2'). Deploying against it would redeploy every service. Run: git -C ~/$VPS_PATH pull --ff-only"
+              exit 1
+          fi
+
+      # ------------------------------------------------------------ current state ----
+      # "If the SHA is null, don't touch that container" lives here: a service that was not
+      # selected keeps whatever tag the VPS is already running.
+      - name: Read current tags from the VPS
+        id: current
+        env:
+          SELECTED: ${{ steps.validate.outputs.services }}
+          IN_API_TAG: ${{ inputs.api_tag }}
+          IN_UI_TAG: ${{ inputs.ui_tag }}
+          IN_AUTH_TAG: ${{ inputs.auth_tag }}
+        run: |
+          set -euo pipefail
+
+          env_exists=$(ssh $SSH_OPTS "$REMOTE" "test -f '$VPS_PATH/.env' && echo yes || echo no")
+          echo "env_exists=$env_exists" >> "$GITHUB_OUTPUT"
+
+          fail=0
+          carried=()
+
+          for svc in api ui auth; do
+              upper=${svc^^}
+              input_var="IN_${upper}_TAG"
+
+              if [[ " $SELECTED " == *" $svc "* ]]; then
+                  resolved=${!input_var}
+              elif [[ $env_exists == no ]]; then
+                  echo "::error::First deploy: no .env exists on the VPS yet, so all three tags must be supplied. '$svc' was left unticked."
+                  fail=1
+                  continue
+              else
+                  resolved=$(ssh $SSH_OPTS "$REMOTE" "cd '$VPS_PATH' && ./deploy.sh --read-env-key ${upper}_TAG")
+                  # Compose only *warns* on an unresolved variable, so a blank carry-forward
+                  # would render `image: registry/ui:` and fail much later with an opaque
+                  # "invalid reference format". Catch it here, where the cause is obvious.
+                  if [[ ! $resolved =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+                      echo "::error::Cannot carry forward ${upper}_TAG: the value in the VPS .env is missing or malformed. Fix it on the box, or tick '$svc' and supply a tag explicitly."
+                      fail=1
+                      continue
+                  fi
+                  carried+=("$svc=$resolved")
+              fi
+
+              echo "${svc}_tag=$resolved" >> "$GITHUB_OUTPUT"
+          done
+
+          (( fail == 0 )) || exit 1
+
+          echo "carried=${carried[*]}" >> "$GITHUB_OUTPUT"
+
+      # The failure this prevents is a deferred one. If a credential in GitHub does not match
+      # the live Postgres role, deploying only `ui` rewrites .env harmlessly — and then a
+      # routine `api` deploy weeks later recreates the container with the wrong password,
+      # producing an outage that looks unrelated to the change that caused it.
+      - name: Check for credential drift
+        if: ${{ steps.current.outputs.env_exists == 'yes' && !inputs.allow_secret_change }}
+        env:
+          APP_DB_PASSWORD: ${{ secrets.APP_DB_PASSWORD }}
+          KC_DB_PASSWORD: ${{ secrets.KC_DB_PASSWORD }}
+          KC_ADMIN: ${{ secrets.KC_ADMIN }}
+          KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          fail=0
+
+          for name in APP_DB_PASSWORD KC_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD; do
+              on_vps=$(ssh $SSH_OPTS "$REMOTE" "cd '$VPS_PATH' && ./deploy.sh --read-env-key $name")
+              if [[ $on_vps != "${!name}" ]]; then
+                  echo "::error::Secret drift: $name differs between the repo secret and the VPS .env. If this is a deliberate rotation, re-run with 'Allow DB/Keycloak credentials to differ' ticked — and make sure the Postgres role was changed to match."
+                  fail=1
+              fi
+          done
+
+          (( fail == 0 )) || exit 1
+          echo "No drift: the four credentials match what the VPS is already using."
+
+      # ------------------------------------------------------------------ deploy ----
+      # Staged, not installed. The pull below is what proves the tags exist in Artifact
+      # Registry, and until it succeeds `.env` is untouched and no container has been
+      # recreated — so a mistyped SHA costs a red run and nothing else.
+      - name: Stage the rendered .env
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          APP_DB_PASSWORD: ${{ secrets.APP_DB_PASSWORD }}
+          KC_DB_PASSWORD: ${{ secrets.KC_DB_PASSWORD }}
+          KC_ADMIN: ${{ secrets.KC_ADMIN }}
+          KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
+          API_TAG: ${{ steps.current.outputs.api_tag }}
+          UI_TAG: ${{ steps.current.outputs.ui_tag }}
+          AUTH_TAG: ${{ steps.current.outputs.auth_tag }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          # Tags are bare — they are already constrained to [A-Za-z0-9._-]. Credentials are
+          # single-quoted, the one form Compose does not interpolate: unquoted, a password
+          # containing $ is silently truncated and surfaces much later as a database
+          # connection timeout. See the warning block at the top of .env.example.
+          rendered=$(
+              printf '# Rendered by .github/workflows/deploy.yml (run %s). Hand edits are lost on the next deploy.\n' "$GITHUB_RUN_ID"
+              printf 'REGISTRY=%s-docker.pkg.dev/%s/%s\n' "$REGION" "$GCP_PROJECT_ID" "$REPOSITORY"
+              printf 'API_TAG=%s\n' "$API_TAG"
+              printf 'UI_TAG=%s\n' "$UI_TAG"
+              printf 'AUTH_TAG=%s\n' "$AUTH_TAG"
+              printf "APP_DB_PASSWORD='%s'\n" "$APP_DB_PASSWORD"
+              printf "KC_DB_PASSWORD='%s'\n" "$KC_DB_PASSWORD"
+              printf "KC_ADMIN='%s'\n" "$KC_ADMIN"
+              printf "KC_ADMIN_PASSWORD='%s'\n" "$KC_ADMIN_PASSWORD"
+          )
+
+          # Piped rather than scp'd: scp without -p lands the file at the remote umask (0644)
+          # and only then gets chmod'ed, leaving production credentials briefly world-readable.
+          # A pipe also keeps them out of argv, and therefore out of `ps` on the VPS.
+          printf '%s\n' "$rendered" \
+              | ssh $SSH_OPTS "$REMOTE" "umask 077 && cat > '$VPS_PATH/.env.staged'"
+
+          echo "Staged .env on the VPS (contents deliberately not logged)."
+
+      - name: Pull images against the staged .env
+        env:
+          SELECTED: ${{ steps.validate.outputs.services }}
+        run: |
+          set -euo pipefail
+          # --env-file suppresses the default .env, which is why the staged file has to carry
+          # all eight keys rather than a delta. The project name comes from `name: planelyx`
+          # inside the compose file, so this and the real `up` address the same project.
+          ssh $SSH_OPTS "$REMOTE" \
+              "cd '$VPS_PATH' && docker compose -f compose.prod.yaml --env-file .env.staged pull $SELECTED"
+
+      - name: Deploy
+        env:
+          SELECTED: ${{ steps.validate.outputs.services }}
+        run: |
+          set -euo pipefail
+          # .env.prev is the only record of the previously-deployed tags, since they are
+          # deliberately not committed. It is what a rollback reads.
+          # The braces matter: without them the `|| true` would also swallow a failed `cd`,
+          # and the deploy would run against whatever is in the login directory.
+          ssh $SSH_OPTS "$REMOTE" \
+              "cd '$VPS_PATH' && { cp .env .env.prev 2>/dev/null || true; } && mv .env.staged .env && ./deploy.sh $SELECTED"
+
+      # ------------------------------------------------------------------ verify ----
+      - name: Smoke checks
+        env:
+          SELECTED: ${{ steps.validate.outputs.services }}
+        run: |
+          set -euo pipefail
+          fail=0
+
+          if [[ " $SELECTED " == *" ui "* ]]; then
+              if curl -fsS --retry 5 --retry-delay 3 -o /dev/null "$PUBLIC_URL/ui/"; then
+                  echo "ui: $PUBLIC_URL/ui/ serves 200"
+              else
+                  echo "::error::ui: $PUBLIC_URL/ui/ did not return 200."
+                  fail=1
+              fi
+          fi
+
+          if [[ " $SELECTED " == *" auth "* ]]; then
+              # The single most valuable assertion in this workflow. The API validates JWTs by
+              # issuer alone, so if this string drifts every authenticated request 401s — and
+              # that is exactly what a KC_HOSTNAME or KC_PROXY_HEADERS regression does.
+              want="$PUBLIC_URL/auth/realms/planelyx"
+              got=$(curl -fsS --retry 5 --retry-delay 3 \
+                  "$PUBLIC_URL/auth/realms/planelyx/.well-known/openid-configuration" | jq -r '.issuer') || got=""
+              if [[ $got == "$want" ]]; then
+                  echo "auth: issuer is $got"
+              else
+                  echo "::error::auth: issuer is '${got:-unreachable}', expected '$want'."
+                  fail=1
+              fi
+          fi
+
+          if [[ " $SELECTED " == *" api "* ]]; then
+              # nginx deliberately 404s /actuator, so the public side cannot see the health
+              # endpoint — a 404 there is indistinguishable from a healthy deploy. Check it
+              # from the VPS instead.
+              health=$(ssh $SSH_OPTS "$REMOTE" \
+                  "curl -fsS --retry 5 --retry-delay 3 http://127.0.0.1:8082/actuator/health") || health=""
+              if [[ $health == *'"status":"UP"'* ]]; then
+                  echo "api: /actuator/health is UP"
+              else
+                  echo "::error::api: /actuator/health returned '${health:-unreachable}'."
+                  fail=1
+              fi
+
+              # And once publicly, to prove nginx -> container -> Spring Security is wired end
+              # to end. 401 is the pass condition here; 502 means the container is not there.
+              code=$(curl -s -o /dev/null -w '%{http_code}' --retry 5 --retry-delay 3 \
+                  "$PUBLIC_URL/api/bank-accounts") || code="000"
+              if [[ $code == 401 ]]; then
+                  echo "api: $PUBLIC_URL/api/bank-accounts rejects anonymous callers with 401"
+              else
+                  echo "::error::api: $PUBLIC_URL/api/bank-accounts returned $code, expected 401."
+                  fail=1
+              fi
+          fi
+
+          (( fail == 0 )) || exit 1
+
+      # Deployed tags are deliberately not committed, so this summary is the deploy history.
+      - name: Summary
+        if: ${{ always() && steps.validate.outputs.services != '' }}
+        env:
+          SELECTED: ${{ steps.validate.outputs.services }}
+          CARRIED: ${{ steps.current.outputs.carried }}
+          API_TAG: ${{ steps.current.outputs.api_tag }}
+          UI_TAG: ${{ steps.current.outputs.ui_tag }}
+          AUTH_TAG: ${{ steps.current.outputs.auth_tag }}
+        run: |
+          set -euo pipefail
+          {
+              echo "## Deploy — ${{ job.status }}"
+              echo
+              echo "| Service | Tag | |"
+              echo "|---|---|---|"
+              for svc in api ui auth; do
+                  upper=${svc^^}
+                  tag_var="${upper}_TAG"
+                  tag=${!tag_var:-—}
+                  if [[ " $SELECTED " == *" $svc "* ]]; then
+                      echo "| \`$svc\` | \`$tag\` | **deployed** |"
+                  else
+                      echo "| \`$svc\` | \`$tag\` | untouched |"
+                  fi
+              done
+              echo
+              echo "Rollback: re-run this workflow with the tags from the previous run, or read \`.env.prev\` on the VPS."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # `if: always()` cannot help when SSH itself is what failed — deploy.sh also removes a
+      # stale .env.staged at startup, so a leftover can never be read as current state.
+      - name: Clean up
+        if: always()
+        run: |
+          # The remote cleanup needs the key, so it has to run before the local one.
+          if [[ -n ${REMOTE:-} ]]; then
+              ssh $SSH_OPTS "$REMOTE" "rm -f '$VPS_PATH/.env.staged'" || true
+          fi
+          rm -f ~/.ssh/deploy_key ~/.ssh/deploy_known_hosts

@@ -12,9 +12,13 @@ networks:
         # 172.16.0.0/12. Keep these two in step.
         - subnet: 172.20.0.0/16
 
+# A missing variable is only a *warning* to Compose — `${UI_TAG}` unset would render
+# `image: .../ui:` and reach the daemon as `invalid reference format`, far from the cause.
+# `:?` turns that into an immediate, named failure. `.github/workflows/deploy.yml` renders
+# this file's `.env`, so the guard is what stops a bad render from reaching production.
 services:
   ui:
-    image: ${REGISTRY}/ui:${UI_TAG}
+    image: ${REGISTRY:?REGISTRY is not set}/ui:${UI_TAG:?UI_TAG is not set}
     restart: unless-stopped
     ports: ['127.0.0.1:8081:8080']
     networks: [planelyx]
@@ -25,7 +29,7 @@ services:
         max-file: '3'
 
   api:
-    image: ${REGISTRY}/api:${API_TAG}
+    image: ${REGISTRY:?REGISTRY is not set}/api:${API_TAG:?API_TAG is not set}
     restart: unless-stopped
     ports: ['127.0.0.1:8082:8080']
     networks: [planelyx]
@@ -54,7 +58,7 @@ services:
     logging: *logging
 
   auth:
-    image: ${REGISTRY}/auth:${AUTH_TAG}
+    image: ${REGISTRY:?REGISTRY is not set}/auth:${AUTH_TAG:?AUTH_TAG is not set}
     restart: unless-stopped
     ports: ['127.0.0.1:8083:8080']
     networks: [planelyx]
