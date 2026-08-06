@@ -77,6 +77,7 @@ jobs:
           KC_ADMIN: ${{ secrets.KC_ADMIN }}
           KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
+          PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
         run: |
           set -euo pipefail
           fail=0
@@ -108,7 +109,7 @@ jobs:
           # rendered single-quoted because that is the only form Compose leaves un-interpolated
           # (see the $-truncation warning in .env.example), so this is a hard constraint rather
           # than a style rule. `openssl rand -base64 32` never emits ' or $.
-          for name in GCP_PROJECT_ID APP_DB_PASSWORD KC_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET; do
+          for name in GCP_PROJECT_ID APP_DB_PASSWORD KC_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET; do
               value=${!name}
               if [[ -z $value ]]; then
                   echo "::error::Repo secret $name is empty or not set."
@@ -224,11 +225,12 @@ jobs:
           KC_ADMIN: ${{ secrets.KC_ADMIN }}
           KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
+          PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
         run: |
           set -euo pipefail
           fail=0
 
-          for name in APP_DB_PASSWORD KC_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET; do
+          for name in APP_DB_PASSWORD KC_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET; do
               on_vps=$(ssh $SSH_OPTS "$REMOTE" "cd '$VPS_PATH' && ./deploy.sh --read-env-key $name")
               if [[ $on_vps != "${!name}" ]]; then
                   echo "::error::Secret drift: $name differs between the repo secret and the VPS .env. If this is a deliberate rotation, re-run with 'Allow DB/Keycloak credentials to differ' ticked — and make sure the Postgres role was changed to match."
@@ -237,7 +239,7 @@ jobs:
           done
 
           (( fail == 0 )) || exit 1
-          echo "No drift: the five credentials match what the VPS is already using."
+          echo "No drift: the six credentials match what the VPS is already using."
 
       # ------------------------------------------------------------------ deploy ----
       # Staged, not installed. The pull below is what proves the tags exist in Artifact
@@ -251,6 +253,7 @@ jobs:
           KC_ADMIN: ${{ secrets.KC_ADMIN }}
           KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
+          PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
           API_TAG: ${{ steps.current.outputs.api_tag }}
           UI_TAG: ${{ steps.current.outputs.ui_tag }}
           AUTH_TAG: ${{ steps.current.outputs.auth_tag }}
@@ -273,6 +276,7 @@ jobs:
               printf "KC_ADMIN='%s'\n" "$KC_ADMIN"
               printf "KC_ADMIN_PASSWORD='%s'\n" "$KC_ADMIN_PASSWORD"
               printf "KEYCLOAK_ADMIN_CLIENT_SECRET='%s'\n" "$KEYCLOAK_ADMIN_CLIENT_SECRET"
+              printf "PLANELYX_PROVISIONING_SECRET='%s'\n" "$PLANELYX_PROVISIONING_SECRET"
           )
 
           # Piped rather than scp'd: scp without -p lands the file at the remote umask (0644)

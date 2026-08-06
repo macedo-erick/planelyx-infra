@@ -1114,11 +1114,18 @@ In `planelyx-infra` → Settings → Secrets and variables → Actions:
 | `KC_DB_PASSWORD` | the `keycloak` role's password |
 | `KC_ADMIN` | Keycloak bootstrap admin username |
 | `KC_ADMIN_PASSWORD` | Keycloak bootstrap admin password |
+| `KEYCLOAK_ADMIN_CLIENT_SECRET` | secret of the `planelyx-api-admin` client — **read out of the Keycloak admin console**, not generated |
+| `PLANELYX_PROVISIONING_SECRET` | signs Keycloak's "a user registered" callback to the API; generate with `openssl rand -hex 32` |
 
-The last four must **byte-match what is in `.env` on the box right now**. The workflow
+The last six must **byte-match what is in `.env` on the box right now**. The workflow
 compares them before it deploys and refuses to continue if they differ, precisely so a
 mismatch surfaces here rather than weeks later, when an unrelated deploy recreates a container
 with a password Postgres rejects.
+
+`PLANELYX_PROVISIONING_SECRET` is the one that fails quietly rather than loudly. A mismatch
+does not break sign-in — it makes the API reject the provisioning callback, so new accounts
+arrive with no default categories. Nothing retries past ~20 seconds and there is no second
+trigger to recover from, so rotate it by restarting `api` and `auth` together.
 
 No `GCP_SA_KEY` is needed. The VPS already holds its own read-only registry login from
 [§11](#11-artifact-registry-access), and the runner never touches the registry.

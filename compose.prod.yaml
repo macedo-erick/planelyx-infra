@@ -62,6 +62,12 @@ services:
       # secret with the same invalid_client 401 as a wrong one — indistinguishable from a
       # genuinely bad credential, and a long way from the real cause.
       KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:?KEYCLOAK_ADMIN_CLIENT_SECRET is not set}
+      # Verifies the HMAC on Keycloak's "a user registered" callback, which is what seeds a new
+      # user's default categories. Guarded because an unset value renders as empty and every
+      # callback would then be rejected as unsigned — new accounts would arrive with no categories,
+      # nothing retries past ~20s, and there is no second trigger to recover from. The auth
+      # service is handed the same key, so signature and check cannot drift.
+      PLANELYX_PROVISIONING_SECRET: ${PLANELYX_PROVISIONING_SECRET:?PLANELYX_PROVISIONING_SECRET is not set}
       # Same-origin in production so CORS never fires, but a correct value costs nothing.
       PLANELYX_CORS_ORIGINS: https://planelyx.com
     # Healthcheck is defined in the API image itself (curl /actuator/health).
@@ -103,6 +109,18 @@ services:
       # Same value the api service receives as KEYCLOAK_ADMIN_CLIENT_SECRET; one .env key
       # feeds both sides so the secret Keycloak stores and the one the API sends cannot drift.
       PLANELYX_KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:?KEYCLOAK_ADMIN_CLIENT_SECRET is not set}
+      # Read by the planelyx-provisioning event listener baked into the auth image. It posts over
+      # the Compose network rather than through nginx: /internal has no route from the internet,
+      # which is what keeps this unauthenticated endpoint private.
+      #
+      # `api` depends on `auth`, so this target is briefly unreachable at boot. That is fine — the
+      # listener retries at 1s, 4s and 15s — and the dependency must not be reversed, which would
+      # deadlock the stack. Unlike the variables above, these are read at runtime rather than at
+      # realm import, so they take effect on the existing realm. What does *not*: the realm must
+      # also list `planelyx-provisioning` under Event listeners, and --import-realm cannot add
+      # that to a realm that already exists. Set once by hand in the admin console.
+      PLANELYX_PROVISIONING_URL: http://api:8080/internal/keycloak/user-registered
+      PLANELYX_PROVISIONING_SECRET: ${PLANELYX_PROVISIONING_SECRET:?PLANELYX_PROVISIONING_SECRET is not set}
     healthcheck:
       test:
         [

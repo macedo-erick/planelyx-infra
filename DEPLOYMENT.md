@@ -72,13 +72,19 @@ Two new repos join the existing two:
 |---|---|---|
 | `planelyx-api` (exists) | Spring Boot | image `api` |
 | `planelyx-ui` (exists) | Angular | image `ui` (nginx + static) |
-| `planelyx-auth` (**new**) | Keycloak Dockerfile, `realm-export.json`, `themes/planelyx/` | image `auth` |
+| `planelyx-auth` (**new**) | Keycloak Dockerfile, `realm-export.json`, `themes/planelyx/`, `spi/` (the `planelyx-provisioning` event listener) | image `auth` |
 | `planelyx-infra` (**new**) | `compose.prod.yaml`, nginx site config, `.env.example`, `deploy.sh`, `deploy.yml` | no image — cloned onto the VPS, and runs the deploy |
 
-`planelyx-auth` takes over `planelyx-api/docker/keycloak/` (both the realm export and the
-theme). The API repo's `docker/` directory keeps only `postgres/init-keycloak-db.sql` for
-local dev, and the existing `compose.yaml` stays exactly as it is for local development —
-this runbook does not touch it.
+`planelyx-auth` took over `planelyx-api/docker/keycloak/` (both the realm export and the
+theme). The API repo's `docker/` directory keeps only `postgres/init-keycloak-db.sql`.
+
+**Since 2026-08-06 this is a full move, not a copy.** `planelyx-api/docker/keycloak/` has been
+deleted, and `planelyx-api/compose.yaml` builds the auth image with
+`build: { context: ../planelyx-auth }` rather than pulling `quay.io/keycloak/keycloak:26.0`.
+Local development therefore runs the same image production does, and planelyx-auth is the only
+place Keycloak is configured. Two knock-on effects: local Keycloak now serves under `/auth`
+(the baked `KC_HTTP_RELATIVE_PATH`), and planelyx-api requires planelyx-auth checked out as a
+sibling directory.
 
 > Both git remotes still point at `fintrack-api` / `fintrack-ui`. Renaming is optional and
 > orthogonal — but if you want it, do it *before* wiring CI, not after. (The env vars are
@@ -122,7 +128,9 @@ it the management interface inherits `/auth` and the health probe moves to
 
 ### `planelyx-auth/realm/realm-export.json`
 
-Derived from `planelyx-api/docker/keycloak/realm-export.json`, with three changes:
+Originally derived from `planelyx-api/docker/keycloak/realm-export.json` — now the only copy,
+since that file was deleted and local dev imports this one. It differs from the original in
+three ways:
 
 - `"sslRequired": "none"` → `"external"`
 - the seeded `demo` / `Demo@Fintrack1` user is **removed** — otherwise it is a live
@@ -809,9 +817,10 @@ databases live on the host, so nothing should be lost.
 - **Realm-change workflow.** Since `--import-realm` won't re-import, decide now: admin console
   by hand, or a `kcadm.sh` bootstrap script in `planelyx-auth`. Otherwise the export drifts
   from reality within weeks.
-- **The duplicated Keycloak theme.** `planelyx-auth/themes/` is currently a *copy* of
-  `planelyx-api/docker/keycloak/themes/`, so local dev keeps working unchanged. Two copies
-  will drift — collapse them once local `compose.yaml` points at the built `auth` image.
+- ~~**The duplicated Keycloak theme.**~~ **Done (2026-08-06).** They did drift — a change made
+  in one was forgotten in the other. `planelyx-api/docker/keycloak/` was deleted and local
+  `compose.yaml` now builds the `auth` image, so realm, theme and the Keycloak provider exist
+  in exactly one place.
 - **The eslint / prettier backlog** (15 errors, 2 unformatted files) so the UI release gate
   can become blocking instead of `continue-on-error`.
 - **Rename the git remotes** from `fintrack-*` to `planelyx-*`, if you want that finished.
