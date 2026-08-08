@@ -43,7 +43,7 @@ concurrency:
 env:
   # Mirrors the three service repos' release.yml, which push to this same path.
   REGION: southamerica-east1
-  REPOSITORY: docker-remote-repo
+  REPOSITORY: planelyx
   VPS_PATH: planelyx-infra
   PUBLIC_URL: https://planelyx.com
 
