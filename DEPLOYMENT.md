@@ -33,6 +33,8 @@ the VPS itself and are steps you run rather than code you ship.
 - [x] **Phase 7** — `planelyx-infra` (`compose.prod.yaml`, `deploy.sh`)
 - [x] **Phase 8** — `planelyx-infra` deploy workflow — SSH-driven, per-service (needs the VPS
       secrets set; see `VPS_SETUP.md` §13)
+- [x] **Phase 9** — no checkout on the VPS: the workflow ships `compose.prod.yaml` and absorbs
+      `deploy.sh`, which is deleted
 
 **Run on the host, in this order:**
 
@@ -73,7 +75,7 @@ Two new repos join the existing two:
 | `planelyx-api` (exists) | Spring Boot | image `api` |
 | `planelyx-ui` (exists) | Angular | image `ui` (nginx + static) |
 | `planelyx-auth` (**new**) | Keycloak Dockerfile, `realm-export.json`, `themes/planelyx/`, `spi/` (the `planelyx-provisioning` event listener) | image `auth` |
-| `planelyx-infra` (**new**) | `compose.prod.yaml`, nginx site config, `.env.example`, `deploy.sh`, `deploy.yml` | no image — cloned onto the VPS, and runs the deploy |
+| `planelyx-infra` (**new**) | `compose.prod.yaml`, nginx site config, `.env.example`, `deploy.yml` | no image — ships `compose.prod.yaml` to the VPS and runs the deploy |
 
 `planelyx-auth` took over `planelyx-api/docker/keycloak/` (both the realm export and the
 theme). The API repo's `docker/` directory keeps only `postgres/init-keycloak-db.sql`.
@@ -376,7 +378,7 @@ tags.
 **Registry:** `southamerica-east1-docker.pkg.dev/<PROJECT_ID>/docker-remote-repo/{api,ui,auth}`
 — São Paulo keeps pulls fast if the VPS is in Brazil. The `docker-remote-repo` segment is
 `REPOSITORY` in all three `release.yml` workflows and must match `REGISTRY` in `.env`; point
-one somewhere else and `deploy.sh` pulls from a path CI never wrote to.
+one somewhere else and the deploy pulls from a path CI never wrote to.
 
 **Auth:** a service-account JSON key in `GCP_SA_KEY` — `google-github-actions/auth` with
 `credentials_json`, then `gcloud auth configure-docker southamerica-east1-docker.pkg.dev`.
@@ -620,7 +622,8 @@ docker compose -f compose.prod.yaml up -d --remove-orphans
 docker image prune -f
 ```
 
-Since Phase 8 it also takes an optional service list and gates on health — see below.
+Phase 8 gave it an optional service list and a health gate; Phase 9 deleted it outright and
+moved the logic into the workflow. Kept here as the record of what the deploy started as.
 
 ---
 
@@ -660,7 +663,7 @@ common mistake, not a safety net.)
 
 **Deploying a subset needs two Compose behaviours that are easy to get backwards.** An empty
 service list means *all services*, so "deploy nothing" would silently mean "deploy
-everything" — guarded in the workflow and again in `deploy.sh`. And `--no-deps` drops
+everything" — guarded in the validation step and again in the remote script. And `--no-deps` drops
 dependency edges outright, not merely to services outside the selection: `up --no-deps ui api
 auth` would start `api` without waiting for `auth` to be healthy, and the API resolves the
 OIDC metadata at startup. So selecting all three deliberately takes the whole-stack path.
@@ -682,8 +685,51 @@ dotenv parser is not a shell, so single quotes admit no escape at all and a valu
 `running|healthy`. It previously ended on `docker compose ps` and returned 0 regardless, so a
 container in a restart loop read as a successful deploy. 300s is a floor, not a guess —
 `auth`'s healthcheck alone allows 45s + 20×10s. `ui` declares no healthcheck, so `--wait`
-settles for `running` there; the script re-checks its restart counter after a dwell, which is
-the only signal separating "started" from "crash-looping".
+settles for `running` there; the restart counter is re-checked after a dwell, which is the
+only signal separating "started" from "crash-looping". Phase 9 moved all of this into the
+workflow unchanged.
+
+---
+
+## Phase 9 — no checkout on the VPS
+
+Phase 8 left one thing outside the pipeline: the VPS still held a git clone of this repo, and
+`compose.prod.yaml` and `deploy.sh` were read from it. Deploying a compose change therefore
+took two operations in two places — merge here, `git pull --ff-only` there — and only the
+first one was recorded anywhere.
+
+The failure that motivated this is the one that *doesn't* announce itself. Forget the pull and
+the deploy still goes green; it just runs against an older topology. Phase 8 papered over it
+with an interface probe: `deploy.sh --print-interface` had to print `v2`, and the workflow
+stopped if it didn't. That caught a stale *script*, which was the acute case — an earlier
+`deploy.sh` ignored its arguments, so `./deploy.sh api` against an old checkout would quietly
+redeploy all three services. It did nothing about a stale compose file.
+
+**Ship the file instead of pinning a version of it.** `compose.prod.yaml` is now sent to the
+box over SSH from the commit being deployed, next to the `.env` that was already rendered
+there. The staleness check went with it — not because the risk was accepted, but because the
+state it guarded no longer exists. The same reasoning retires `deploy.sh`: a script on the VPS
+is a second copy of the deploy logic that can disagree with the workflow, and everything it
+did (the `--no-deps` branching, the health gate, the `ui` dwell, the prune) is thirty lines of
+Compose invocation that the workflow can issue directly over SSH.
+
+**Both files stage before either installs.** `compose.prod.yaml.staged` and `.env.staged` are
+written first; the pull runs against both; only then does a single step `mv` them into place
+together. So the window where the box holds a new compose file and an old `.env` — or the
+reverse — never opens, and a failed pull still costs a red run and nothing else. Phase 8
+already did this for `.env`; extending it to the compose file was the whole change.
+
+**What is deliberately not shipped:** the nginx configs. They live in `/etc/nginx`, are
+root-owned, and need `nginx -t` plus a reload. Giving the deploy key the sudo rights to
+install them would buy a rarely-used convenience with a permanent increase in what a
+compromised CI credential can do.
+
+Reading `.env` on the VPS was the one thing `deploy.sh` did that isn't a Compose command —
+`--read-env-key`, used to carry forward the tags of unselected services and to compare
+credentials. That parser now runs over `ssh bash -s` from a quoted heredoc. The heredoc is the
+point: the expression is dense with quotes and backslashes, and re-quoting it to survive a
+remote shell is exactly how it would acquire a bug that only shows up on a password containing
+the wrong character.
 
 ---
 
@@ -697,7 +743,9 @@ start until the realm exists.
 3. nginx site config with an HTTP-only stub → `certbot --nginx` → real certs.
 4. `docker login` to Artifact Registry with the read-only SA key.
 5. CI green in all three repos; note the image SHAs.
-6. `.env` on the VPS with those SHAs; `./deploy.sh`.
+6. `.env` and `compose.prod.yaml` on the VPS with those SHAs;
+   `docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300`. This is the only
+   hand-run deploy — everything after cutover goes through the workflow.
 7. **Watch `docker compose logs -f auth`** and confirm the realm import ran. If the realm is
    wrong, the cheapest fix *right now* is
    `DROP DATABASE keycloak; CREATE DATABASE keycloak OWNER keycloak;` and restart. Once real
@@ -804,7 +852,8 @@ curl -s -H "Authorization: Bearer $TOKEN" https://planelyx.com/api/dashboard
 
 ### Persistence
 
-`docker compose down && ./deploy.sh`, then confirm your user and data are still there. Both
+`docker compose down && docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300`,
+then confirm your user and data are still there. Both
 databases live on the host, so nothing should be lost.
 
 ---
@@ -828,7 +877,7 @@ databases live on the host, so nothing should be lost.
   runs on startup, so expect a few seconds of 502. Fine for now; revisit when it stops being
   fine.
 - **Image disk usage grows monotonically.** Every deploy pins a fresh SHA tag and old SHA tags
-  are never removed, so the `docker image prune -f` in `deploy.sh` reclaims almost nothing —
+  are never removed, so the `docker image prune -f` at the end of each deploy reclaims almost nothing —
   it only touches *dangling* images. That is exactly right for rollback (the previous image
   keeps its tag and stays local, so reverting needs no registry round trip), and it is why
   `-a` must never be added: `prune -a` deletes precisely the images you would roll back to.

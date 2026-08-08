@@ -3,8 +3,8 @@
 Planelyx is a personal-finance application. It is split across four repositories — a Spring
 Boot API, an Angular SPA, a Keycloak image carrying the realm and login theme, and this one,
 which is the deployment layer. Everything that lives on the VPS is here: the production
-Compose stack, the host nginx config, and the deploy script. Clone this to the VPS; it builds
-nothing.
+Compose stack and the host nginx config. It builds nothing, and the VPS holds no checkout of
+it — the deploy workflow ships `compose.prod.yaml` to the box from the commit being deployed.
 
 The whole system runs on a single VPS. GitHub Actions builds each service and pushes it to
 GCP Artifact Registry; the VPS pulls those images into a Compose stack that sits behind a
@@ -14,7 +14,7 @@ host-installed nginx, with all three services routed by path under one hostname.
 planelyx-api    Spring Boot, JWT resource server        ->  /api/
 planelyx-ui     Angular SPA served by nginx             ->  /ui/
 planelyx-auth   Keycloak image (realm + login theme)    ->  /auth/
-planelyx-infra  this repo — Compose, nginx, deploy.sh
+planelyx-infra  this repo — Compose, nginx, deploy workflow
 ```
 
 ## Start here
@@ -32,10 +32,9 @@ real time, not just the happy path.
 ## Layout
 
 ```
-compose.prod.yaml            ui / api / auth, all bound to 127.0.0.1
-deploy.sh                    pull + up -d + health gate + prune; takes an optional service list
-.github/workflows/deploy.yml manual deploy over SSH; renders .env from repo secrets
-.env.example                 copy to .env, chmod 600 (workflow-managed after the first deploy)
+compose.prod.yaml            ui / api / auth, all bound to 127.0.0.1; shipped to the VPS per deploy
+.github/workflows/deploy.yml the whole deploy: ships compose, renders .env, pulls, up -d, verifies
+.env.example                 reference only — the workflow renders the real .env on every run
 nginx/planelyx.conf          -> /etc/nginx/sites-available/planelyx
 nginx/snippets/planelyx-proxy.conf -> /etc/nginx/snippets/
 ```
@@ -72,19 +71,29 @@ of truth for the DB and Keycloak credentials** — a value hand-edited on the bo
 the next deploy. It refuses to deploy if the two disagree, unless you tell it you are
 rotating.
 
-`deploy.sh` remains the manual and break-glass path, and now takes an optional service list:
+There is no deploy script on the VPS, and no checkout of this repo to keep current. The
+workflow ships `compose.prod.yaml` from the commit it is deploying, so the running topology
+cannot lag behind master and there is no `git pull` to forget.
+
+The break-glass path is Compose directly. The last successful deploy leaves both
+`compose.prod.yaml` and `.env` in `~/planelyx-infra`, so on the box:
 
 ```bash
 # once, on the VPS
 cat sa-key.json | docker login -u _json_key --password-stdin \
   https://southamerica-east1-docker.pkg.dev
 
-./deploy.sh              # whole stack
-./deploy.sh api          # only the api container; ui and auth keep running
+cd ~/planelyx-infra
+docker compose -f compose.prod.yaml pull
+docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300 --remove-orphans
+
+# one service only — --no-deps keeps it from restarting ui and auth
+docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300 --no-deps api
 ```
 
-Either way the tags come from `.env`. Editing them by hand and running `./deploy.sh` still
-works — just expect the next workflow run to reconcile the file against the repo secrets.
+The tags come from `.env`. Editing them by hand works, but the next workflow run reconciles
+the file against the repo secrets — and if you also edited `compose.prod.yaml` on the box,
+that edit is overwritten by the shipped copy. Change it here and deploy.
 
 ## Two things that will bite you
 

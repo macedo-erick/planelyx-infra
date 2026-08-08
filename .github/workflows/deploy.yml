@@ -7,6 +7,11 @@ name: deploy
 # so unselected services end up with a byte-identical `image:` line and Compose leaves their
 # containers alone.
 #
+# The VPS holds no git checkout of this repo. `compose.prod.yaml` is shipped from the commit
+# being deployed, so the running topology can never drift from what is on master — and there
+# is no `git pull` to forget. nginx is the exception: its configs live in /etc/nginx, are
+# root-owned, and are still installed by hand (see VPS_SETUP.md).
+#
 # `.env` on the VPS is rendered from the secrets below on every run. That makes GitHub the
 # source of truth for those credentials — a value hand-edited on the box is reverted by the
 # next deploy. The drift check exists so that reversion can never happen silently.
@@ -46,6 +51,10 @@ env:
   REPOSITORY: planelyx
   VPS_PATH: planelyx-infra
   PUBLIC_URL: https://planelyx.com
+  # `--wait-timeout` is mandatory, because without it `--wait` waits forever. 300s is a floor,
+  # not a guess: auth's healthcheck is start_period 45s + 20 retries x 10s, and api runs Flyway
+  # before it reports healthy.
+  WAIT_TIMEOUT: '300'
 
 jobs:
   deploy:
@@ -55,6 +64,10 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      # compose.prod.yaml is shipped to the VPS from this checkout, which is what removes the
+      # need for a clone on the box.
+      - uses: actions/checkout@v5
+
       # ---------------------------------------------------------------- validate ----
       # Everything that can be judged without touching the VPS is judged here, so a
       # malformed request never reaches production.
@@ -150,19 +163,20 @@ jobs:
               echo "REMOTE=$VPS_USER@$VPS_HOST"
           } >> "$GITHUB_ENV"
 
-      # A stale checkout is the one failure that would be invisible: the previous deploy.sh
-      # ignored extra arguments, so `./deploy.sh api` on an un-pulled VPS would quietly
-      # redeploy all three services from the .env this workflow just rewrote.
-      - name: Check the VPS checkout is current
+      # ------------------------------------------------------------------- ship ----
+      # Staged rather than installed, for the same reason as `.env` below: until the pull has
+      # proved the tags exist, nothing on the VPS has changed. Shipping the compose file
+      # straight from this commit is what removes the stale-checkout failure mode, where a
+      # deploy silently ran against an older topology.
+      #
+      # Also the first SSH of the run, so a broken key or host pin fails here rather than
+      # halfway through.
+      - name: Ship compose.prod.yaml
         run: |
           set -euo pipefail
-          ssh $SSH_OPTS "$REMOTE" true
-
-          interface=$(ssh $SSH_OPTS "$REMOTE" "cd '$VPS_PATH' && ./deploy.sh --print-interface" 2>/dev/null) || interface=""
-          if [[ $interface != v2 ]]; then
-              echo "::error::The VPS checkout of planelyx-infra is out of date (deploy.sh interface: '${interface:-none}', expected 'v2'). Deploying against it would redeploy every service. Run: git -C ~/$VPS_PATH pull --ff-only"
-              exit 1
-          fi
+          ssh $SSH_OPTS "$REMOTE" "mkdir -p '$VPS_PATH'"
+          ssh $SSH_OPTS "$REMOTE" "cat > '$VPS_PATH/compose.prod.yaml.staged'" < compose.prod.yaml
+          echo "Shipped compose.prod.yaml from ${GITHUB_SHA:0:7}"
 
       # ------------------------------------------------------------ current state ----
       # "If the SHA is null, don't touch that container" lives here: a service that was not
@@ -176,6 +190,27 @@ jobs:
           IN_AUTH_TAG: ${{ inputs.auth_tag }}
         run: |
           set -euo pipefail
+
+          # Read one key out of the VPS `.env`, the way Compose would. `bash -s` rather than a
+          # remote command string: the parser below is dense with quotes, and re-quoting it for
+          # the remote shell is how it would acquire a bug nobody can see.
+          #
+          # `tail -n1` is last-key-wins, matching Compose (and never `head`, which SIGPIPEs the
+          # producer and trips pipefail). `tr -d '\r'` is not defensive padding: a CRLF .env
+          # yields a tag ending in \r, and the only symptom is `manifest unknown` for a SHA you
+          # can see in the registry. Only a *matched* surrounding pair of quotes is stripped.
+          # Prints nothing if the key is absent.
+          read_env_key() {
+              ssh $SSH_OPTS "$REMOTE" "bash -s -- '$VPS_PATH' '$1'" <<'REMOTE_SCRIPT'
+          set -euo pipefail
+          cd "$1"
+          [[ -f .env ]] || exit 0
+          sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" .env \
+              | tail -n1 \
+              | tr -d '\r' \
+              | sed -e 's/[[:space:]]*$//' -e "s/^'\(.*\)'\$/\1/" -e "s/^\"\(.*\)\"\$/\1/"
+          REMOTE_SCRIPT
+          }
 
           env_exists=$(ssh $SSH_OPTS "$REMOTE" "test -f '$VPS_PATH/.env' && echo yes || echo no")
           echo "env_exists=$env_exists" >> "$GITHUB_OUTPUT"
@@ -194,7 +229,7 @@ jobs:
                   fail=1
                   continue
               else
-                  resolved=$(ssh $SSH_OPTS "$REMOTE" "cd '$VPS_PATH' && ./deploy.sh --read-env-key ${upper}_TAG")
+                  resolved=$(read_env_key "${upper}_TAG")
                   # Compose only *warns* on an unresolved variable, so a blank carry-forward
                   # would render `image: registry/ui:` and fail much later with an opaque
                   # "invalid reference format". Catch it here, where the cause is obvious.
@@ -228,10 +263,26 @@ jobs:
           PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
         run: |
           set -euo pipefail
+
+          # Same parser as the step above. Duplicated rather than shared because each step is
+          # its own process — and a helper file would have to live on the VPS, which is the
+          # dependency this workflow exists to remove.
+          read_env_key() {
+              ssh $SSH_OPTS "$REMOTE" "bash -s -- '$VPS_PATH' '$1'" <<'REMOTE_SCRIPT'
+          set -euo pipefail
+          cd "$1"
+          [[ -f .env ]] || exit 0
+          sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" .env \
+              | tail -n1 \
+              | tr -d '\r' \
+              | sed -e 's/[[:space:]]*$//' -e "s/^'\(.*\)'\$/\1/" -e "s/^\"\(.*\)\"\$/\1/"
+          REMOTE_SCRIPT
+          }
+
           fail=0
 
           for name in APP_DB_PASSWORD KC_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET; do
-              on_vps=$(ssh $SSH_OPTS "$REMOTE" "cd '$VPS_PATH' && ./deploy.sh --read-env-key $name")
+              on_vps=$(read_env_key "$name")
               if [[ $on_vps != "${!name}" ]]; then
                   echo "::error::Secret drift: $name differs between the repo secret and the VPS .env. If this is a deliberate rotation, re-run with 'Allow DB/Keycloak credentials to differ' ticked — and make sure the Postgres role was changed to match."
                   fail=1
@@ -287,28 +338,82 @@ jobs:
 
           echo "Staged .env on the VPS (contents deliberately not logged)."
 
-      - name: Pull images against the staged .env
+      - name: Pull images against the staged files
         env:
           SELECTED: ${{ steps.validate.outputs.services }}
         run: |
           set -euo pipefail
-          # --env-file suppresses the default .env, which is why the staged file has to carry
-          # all nine keys rather than a delta. The project name comes from `name: planelyx`
-          # inside the compose file, so this and the real `up` address the same project.
+          # Both staged: this is the last step that can fail without having changed anything the
+          # running stack reads. --env-file suppresses the default .env, which is why the staged
+          # file has to carry all ten keys rather than a delta. The project name comes from
+          # `name: planelyx` inside the compose file, so the staged file and the installed one
+          # address the same project.
           ssh $SSH_OPTS "$REMOTE" \
-              "cd '$VPS_PATH' && docker compose -f compose.prod.yaml --env-file .env.staged pull $SELECTED"
+              "cd '$VPS_PATH' && docker compose -f compose.prod.yaml.staged --env-file .env.staged pull $SELECTED"
 
+      # Everything the old deploy.sh did, inlined. It no longer has to exist on the VPS, and
+      # therefore can no longer be out of date there.
       - name: Deploy
         env:
           SELECTED: ${{ steps.validate.outputs.services }}
         run: |
           set -euo pipefail
+          ssh $SSH_OPTS "$REMOTE" bash -s -- "$VPS_PATH" "$WAIT_TIMEOUT" $SELECTED <<'REMOTE_SCRIPT'
+          set -euo pipefail
+          cd "$1"
+          wait_timeout=$2
+          shift 2
+          services=("$@")
+          COMPOSE=compose.prod.yaml
+
+          # The validate step already rejects an empty selection. Asserted again here because
+          # the consequence would be silent: `up --no-deps` with no service names means *every*
+          # service with its dependency edges dropped, which is the one command in this script
+          # that could take the stack down while reporting success.
+          if (( ${#services[@]} == 0 )); then
+              echo "error: no services passed to the deploy script" >&2
+              exit 2
+          fi
+
           # .env.prev is the only record of the previously-deployed tags, since they are
           # deliberately not committed. It is what a rollback reads.
-          # The braces matter: without them the `|| true` would also swallow a failed `cd`,
-          # and the deploy would run against whatever is in the login directory.
-          ssh $SSH_OPTS "$REMOTE" \
-              "cd '$VPS_PATH' && { cp .env .env.prev 2>/dev/null || true; } && mv .env.staged .env && ./deploy.sh $SELECTED"
+          cp .env .env.prev 2>/dev/null || true
+          mv .env.staged .env
+          mv compose.prod.yaml.staged "$COMPOSE"
+
+          dump_logs() {
+              echo >&2
+              echo "--- last 50 log lines per deployed service ---" >&2
+              docker compose -f "$COMPOSE" logs --tail 50 "${services[@]}" >&2 || true
+          }
+
+          # `--wait` blocks until every service it touched is running|healthy and exits non-zero
+          # otherwise.
+          #
+          # Deploying all three takes the whole-stack path deliberately. `--no-deps` drops
+          # dependency edges outright — not just to services outside the selection — so
+          # `up --no-deps ui api auth` would start api without waiting for auth to be healthy,
+          # and api resolves the OIDC metadata at startup. `--remove-orphans` also belongs only
+          # here: it is a whole-stack statement, and scoping it to a subset risks classifying
+          # the untouched services as orphans.
+          if (( ${#services[@]} == 3 )); then
+              docker compose -f "$COMPOSE" up -d --wait --wait-timeout "$wait_timeout" --remove-orphans \
+                  || { dump_logs; exit 1; }
+          else
+              docker compose -f "$COMPOSE" up -d --wait --wait-timeout "$wait_timeout" --no-deps "${services[@]}" \
+                  || { dump_logs; exit 1; }
+          fi
+
+          # Dangling images only — the previous release keeps its SHA tag, so a rollback still
+          # finds it locally. Never add `-a`: that removes every image without a running
+          # container, which is precisely the set you would roll back to. `|| true` because a
+          # transient daemon error here must not fail a deploy that has already passed its
+          # health gate.
+          docker image prune -f || true
+
+          echo
+          docker compose -f "$COMPOSE" ps
+          REMOTE_SCRIPT
 
       # ------------------------------------------------------------------ verify ----
       - name: Smoke checks
@@ -317,8 +422,31 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
+          remote_compose="cd '$VPS_PATH' && docker compose -f compose.prod.yaml"
 
           if [[ " $SELECTED " == *" ui "* ]]; then
+              # `--wait` settles for "running" on a service with no healthcheck, and `ui`
+              # declares none — so a crash-looping nginx would pass the gate the instant it came
+              # up. Give it a dwell and check the restart counter, which is the only signal that
+              # distinguishes the two.
+              cid=$(ssh $SSH_OPTS "$REMOTE" "$remote_compose ps -q ui | tail -n1") || cid=""
+              if [[ -z $cid ]]; then
+                  echo "::error::ui has no container after up."
+                  fail=1
+              else
+                  before=$(ssh $SSH_OPTS "$REMOTE" "docker inspect --format '{{.RestartCount}}' $cid")
+                  sleep 15
+                  after=$(ssh $SSH_OPTS "$REMOTE" "docker inspect --format '{{.RestartCount}}' $cid")
+                  state=$(ssh $SSH_OPTS "$REMOTE" "docker inspect --format '{{.State.Status}}' $cid")
+
+                  if [[ $state == running && $after == "$before" ]]; then
+                      echo "ui: stable (no restarts during dwell)"
+                  else
+                      echo "::error::ui is not stable (state: ${state:-unknown}, restarts: ${before:-?} -> ${after:-?})."
+                      fail=1
+                  fi
+              fi
+
               if curl -fsS --retry 5 --retry-delay 3 -o /dev/null "$PUBLIC_URL/ui/"; then
                   echo "ui: $PUBLIC_URL/ui/ serves 200"
               else
@@ -369,6 +497,20 @@ jobs:
 
           (( fail == 0 )) || exit 1
 
+      # Covers a failed `up` *and* a failed smoke check: a step with `if: failure()` runs when
+      # any earlier step failed. The remote script dumps its own logs when `up` is what broke,
+      # so this is the net for everything after that — a container that came up healthy and
+      # then fell over while the smoke checks were running.
+      - name: Dump logs on failure
+        if: ${{ failure() && steps.validate.outputs.services != '' }}
+        env:
+          SELECTED: ${{ steps.validate.outputs.services }}
+        run: |
+          if [[ -n ${REMOTE:-} ]]; then
+              ssh $SSH_OPTS "$REMOTE" \
+                  "cd '$VPS_PATH' && docker compose -f compose.prod.yaml logs --tail 50 $SELECTED" || true
+          fi
+
       # Deployed tags are deliberately not committed, so this summary is the deploy history.
       - name: Summary
         if: ${{ always() && steps.validate.outputs.services != '' }}
@@ -396,16 +538,19 @@ jobs:
                   fi
               done
               echo
+              echo "Compose file shipped from \`${GITHUB_SHA:0:7}\`."
+              echo
               echo "Rollback: re-run this workflow with the tags from the previous run, or read \`.env.prev\` on the VPS."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # `if: always()` cannot help when SSH itself is what failed — deploy.sh also removes a
-      # stale .env.staged at startup, so a leftover can never be read as current state.
+      # `if: always()` cannot help when SSH itself is what failed. Both staged files are
+      # overwritten at the start of every run before anything reads them, so a leftover from a
+      # run that died mid-flight is inert rather than dangerous.
       - name: Clean up
         if: always()
         run: |
           # The remote cleanup needs the key, so it has to run before the local one.
           if [[ -n ${REMOTE:-} ]]; then
-              ssh $SSH_OPTS "$REMOTE" "rm -f '$VPS_PATH/.env.staged'" || true
+              ssh $SSH_OPTS "$REMOTE" "rm -f '$VPS_PATH/.env.staged' '$VPS_PATH/compose.prod.yaml.staged'" || true
           fi
           rm -f ~/.ssh/deploy_key ~/.ssh/deploy_known_hosts

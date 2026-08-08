@@ -695,13 +695,19 @@ instead of an error.
 
 ### Get the config onto the box
 
-The two files live in `planelyx-infra`. Clone it now (you will need it again in
-[§12](#12-bringing-up-the-stack)):
+The two files live in `planelyx-infra`. Clone it to a scratch location — this is a bootstrap
+checkout, not a permanent one:
 
 ```bash
-$ git clone https://github.com/macedo-erick/planelyx-infra.git ~/planelyx-infra
-$ cd ~/planelyx-infra
+$ git clone https://github.com/macedo-erick/planelyx-infra.git ~/src/planelyx-infra
+$ cd ~/src/planelyx-infra
 ```
+
+> Deliberately **not** `~/planelyx-infra`. That directory is where the stack runs, and the
+> deploy workflow writes `compose.prod.yaml` and `.env` into it on every release. Keeping a
+> git checkout there would mean a working tree permanently dirty against files the workflow
+> owns. [§12](#12-bringing-up-the-stack) copies the two files it needs out of this scratch
+> clone; after that you can delete it.
 
 ### ⚠️ Bootstrap ordering: HTTP first, then certificates
 
@@ -921,11 +927,23 @@ $ gcloud iam service-accounts keys delete <OLD_KEY_ID> \
 
 ## 12. Bringing up the stack
 
+### Create the run directory
+
+`~/planelyx-infra` is where the stack runs. It is a plain directory, not a checkout: from the
+first workflow deploy onwards, both `compose.prod.yaml` and `.env` in here are written by
+`.github/workflows/deploy.yml`. For this manual first boot, copy them out of the scratch clone
+from [§11.5](#get-the-config-onto-the-box):
+
+```bash
+$ mkdir -p ~/planelyx-infra
+$ cd ~/planelyx-infra
+$ cp ~/src/planelyx-infra/compose.prod.yaml .
+$ cp ~/src/planelyx-infra/.env.example .env
+```
+
 ### Write `.env`
 
 ```bash
-$ cd ~/planelyx-infra
-$ cp .env.example .env
 $ chmod 600 .env
 $ nano .env
 ```
@@ -941,8 +959,8 @@ $ nano .env
 Two rules, both worth being pedantic about:
 
 - **`REGISTRY` must match what CI pushed to.** All three `release.yml` workflows use
-  `REPOSITORY: docker-remote-repo`. Point `REGISTRY` anywhere else and `deploy.sh` pulls
-  from a path that has never been written to.
+  `REPOSITORY: docker-remote-repo`. Point `REGISTRY` anywhere else and the pull hits a path
+  that has never been written to.
 - **Pin SHAs, never `latest`.** `latest` makes a redeploy non-reproducible and turns
   rollback into guesswork. With SHAs pinned, rollback is editing three lines.
 
@@ -993,11 +1011,17 @@ $ docker compose -f compose.prod.yaml run --rm auth printenv KC_DB_PASSWORD
 ### First boot
 
 ```bash
-$ ./deploy.sh
+$ docker compose -f compose.prod.yaml pull
+$ docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300 --remove-orphans
 ```
 
-The script pulls the pinned images, brings the stack up and prunes dangling images. It
-refuses to run without a `.env`.
+`--wait` blocks until every service is running or healthy and exits non-zero otherwise;
+`--wait-timeout` is mandatory, because without it `--wait` waits forever. 300s is a floor
+rather than a guess: `auth`'s healthcheck allows a 45s start period plus 20 retries at 10s,
+and `api` runs Flyway before it reports healthy.
+
+This is the only time you run these by hand. From [§13](#13-the-deploy-workflow) onward the
+deploy workflow issues the same two commands over SSH.
 
 Startup ordering is not incidental. `api` declares `depends_on: auth: service_healthy`, so:
 
@@ -1085,12 +1109,11 @@ Confirm the key works **non-interactively**, which is how Actions will use it:
 
 ```bash
 $ ssh -i ~/.ssh/planelyx-deploy -o BatchMode=yes deploy@planelyx.com \
-    'cd planelyx-infra && ./deploy.sh --print-interface && docker compose version'
+    'cd planelyx-infra && docker compose version'
 ```
 
-Three things this proves at once: the key is accepted without a passphrase prompt, the VPS
-checkout is new enough (it must print `v2`), and Docker is reachable as `deploy` without a
-login shell. Also check the registry credential the same way — a `docker login -u _json_key`
+Two things this proves at once: the key is accepted without a passphrase prompt, and Docker is
+reachable as `deploy` without a login shell. Also check the registry credential the same way — a `docker login -u _json_key`
 blob works fine here, but a `gcloud` credential helper needs `gcloud` on the non-interactive
 `PATH` and will fail even though it works when you are logged in:
 
@@ -1132,20 +1155,24 @@ No `GCP_SA_KEY` is needed. The VPS already holds its own read-only registry logi
 
 ### What the workflow now owns
 
-`.env` on the VPS is rendered from those secrets on **every** deploy. That makes GitHub the
-source of truth for those four credentials — see the warning in
-[§15](#15-operations) about what that means for rotation.
+Two files in `~/planelyx-infra` now belong to the workflow, and hand edits to either are lost
+on the next deploy:
 
-The workflow does *not* update the VPS's checkout of this repo. It checks that `deploy.sh` is
-current and stops if it isn't, but pulling is left to you:
+- **`.env`** — rendered from the repo secrets on **every** deploy. That makes GitHub the source
+  of truth for those credentials; see the warning in [§15](#15-operations) about what that
+  means for rotation.
+- **`compose.prod.yaml`** — shipped from the commit being deployed, over SSH, before anything
+  is pulled.
 
-```bash
-$ git -C ~/planelyx-infra pull --ff-only
-```
+Shipping the compose file is what removes the need for a checkout on the box. The alternative
+— a clone that you `git pull` by hand before each release — has one failure mode that is
+invisible when it happens: forget the pull, and the deploy runs against an older topology
+while reporting success. There is no pull to forget now, and no way for the running stack to
+lag behind master.
 
-Deploying container images and changing checked-out infra code are different operations, and
-a release is the wrong moment to silently do both. Anything touching `compose.prod.yaml` or
-the nginx configs is still a manual, deliberate step.
+nginx is the deliberate exception. Its configs live in `/etc/nginx`, are root-owned, and need
+`nginx -t` plus a reload, so they stay a manual step — see
+[§11.5](#get-the-config-onto-the-box).
 
 > `workflow_dispatch` only appears in the Actions tab once the workflow file is on the default
 > branch. If you cannot find the "Run workflow" button, the file is still on a feature branch.
@@ -1262,7 +1289,7 @@ Only a real browser exercises these:
 
 ```bash
 $ docker compose -f compose.prod.yaml down
-$ ./deploy.sh
+$ docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300
 ```
 
 Log back in and confirm your user and data are still there. Both databases live on the host,
@@ -1441,8 +1468,26 @@ point; do not work around it by disabling it. Rotate properly: change the Postgr
 update the repo secret, then run the workflow with *Allow DB/Keycloak credentials to differ*
 ticked.
 
-`./deploy.sh` still works on the box for manual and break-glass use, and now takes an optional
-service list (`./deploy.sh api` touches only the API). It reads the same `.env`.
+For manual and break-glass use, drive Compose directly on the box. The last successful deploy
+leaves both `compose.prod.yaml` and `.env` in `~/planelyx-infra`, so there is nothing to fetch
+first:
+
+```bash
+$ cd ~/planelyx-infra
+$ docker compose -f compose.prod.yaml pull
+$ docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300 --remove-orphans
+
+# one service only
+$ docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300 --no-deps api
+```
+
+`--no-deps` is what keeps a single-service deploy from restarting the other two. Never use it
+on the whole stack: it drops dependency edges outright, so `up --no-deps ui api auth` starts
+`api` without waiting for `auth` to be healthy, and `api` resolves the OIDC metadata at
+startup.
+
+Anything you change in `compose.prod.yaml` on the box is overwritten by the next workflow run,
+which ships its own copy. Real changes go in the repo.
 
 Not zero-downtime: `up -d` restarts the API in place and Flyway runs on startup, so expect
 a few seconds of `502` on `/api`. Fine at this scale; revisit when it stops being fine.
@@ -1457,7 +1502,7 @@ Re-run the deploy workflow with the previous SHAs. This is why you pinned SHAs.
 
 Where to find them: the previous run's job summary lists every service's tag, and `.env.prev`
 on the VPS holds the tags from immediately before the last deploy. The old images are still on
-the box — `deploy.sh` prunes only *dangling* images, and a pinned SHA tag is never dangling —
+the box — the deploy prunes only *dangling* images, and a pinned SHA tag is never dangling —
 so a rollback doesn't even need the registry.
 
 The caveat: **Flyway migrations do not roll back.** If the release you are reverting added a
@@ -1473,7 +1518,7 @@ $ docker system df
 $ sudo du -sh /var/lib/postgresql /var/backups/planelyx /var/lib/docker
 ```
 
-`deploy.sh` already runs `docker image prune -f`. If images still accumulate:
+Every deploy already runs `docker image prune -f`. If images still accumulate:
 
 ```bash
 $ docker system prune -af --filter "until=168h"
@@ -1514,7 +1559,7 @@ $ sudo reboot        # when the kernel changed
 | **Realm changes in `realm-export.json` are not taking effect** | `--import-realm` is a no-op once the realm exists. It only ever runs against an empty `keycloak` database. | Change it in the admin console or via `kcadm.sh`. To re-import, drop and recreate the `keycloak` database — which destroys all users. |
 | **Registration succeeds but login returns** `Account is not fully set up` | User is missing `firstName`/`lastName`; Keycloak 26 marks both required and `requiredActions` reads empty, which hides the cause. | Add the fields in the admin console. Fix `register.ftl` in `planelyx-auth` so it collects them. |
 | **Login redirects to `planelyx.com/dashboard`** and Keycloak rejects the redirect URI | The UI build is missing the `prepareExternalUrl` / `document.baseURI` fixes, so it built redirect URLs from the origin instead of the base href. | Rebuild `ui` from a commit that includes them; redeploy with the new SHA. |
-| **`deploy.sh` fails with** `manifest unknown` **or** `denied` | `REGISTRY` does not match what CI pushed to, the tag SHA is wrong, or the `docker login` credential expired. | Check `REGISTRY` ends in `/docker-remote-repo`. Re-run the `docker login` from [§11](#11-artifact-registry-access). |
+| **A deploy fails with** `manifest unknown` **or** `denied` | `REGISTRY` does not match what CI pushed to, the tag SHA is wrong, or the `docker login` credential expired. | Check `REGISTRY` ends in `/docker-remote-repo`. Re-run the `docker login` from [§11](#11-artifact-registry-access). |
 | **Certificate renewal fails** | Port 80 is blocked, the `:80` server block was removed, or DNS changed. | `sudo certbot renew --dry-run` and read the error. The `:80` block must stay reachable — it is not vestigial. |
 | **Disk full** | Container logs, old images, or backups. | `docker system df`, `du -sh /var/backups/planelyx`. Confirm `/etc/docker/daemon.json` log rotation is in place ([§6](#6-docker-post-install)). |
 | **Random 401s that come and go** | Host clock drift making `exp`/`nbf` validation fail intermittently. | `timedatectl status` — "System clock synchronized" must be `yes`. |
@@ -1538,7 +1583,7 @@ $ curl -s https://planelyx.com/auth/realms/planelyx/.well-known/openid-configura
 **Paths on the host**
 
 ```
-~/planelyx-infra/                              compose.prod.yaml, deploy.sh, .env
+~/planelyx-infra/                              compose.prod.yaml, .env  (both workflow-managed)
 /etc/nginx/sites-available/planelyx            site config
 /etc/nginx/snippets/planelyx-proxy.conf        shared X-Forwarded-* headers
 /etc/letsencrypt/live/planelyx.com/            certificates
