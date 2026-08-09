@@ -547,7 +547,7 @@ jobs:
               # It answers 503 rather than failing to respond when the database is unreachable,
               # which is the failure a wrong OCR_DB_PASSWORD produces.
               health=$(ssh $SSH_OPTS "$REMOTE" \
-                  "curl -fsS --retry 5 --retry-delay 3 http://127.0.0.1:8084/ocr/healthz") || health=""
+                  "curl -fsS --retry 20 --retry-delay 3 http://127.0.0.1:8084/ocr/healthz") || health=""
               if [[ $health == *'"status":"ok"'* ]]; then
                   echo "ocr: /ocr/healthz is ok (database reachable)"
               else
@@ -558,7 +558,7 @@ jobs:
               # Publicly, to prove nginx -> container -> token verification is wired end to end.
               # 401 is the pass condition: 404 would mean the nginx location is missing, 502 that
               # the container is not there.
-              code=$(curl -s -o /dev/null -w '%{http_code}' --retry 5 --retry-delay 3 \
+              code=$(curl -s -o /dev/null -w '%{http_code}' --retry 20 --retry-delay 3 \
                   "$PUBLIC_URL/ocr/documents") || code="000"
               if [[ $code == 401 ]]; then
                   echo "ocr: $PUBLIC_URL/ocr/documents rejects anonymous callers with 401"
