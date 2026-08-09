@@ -41,36 +41,43 @@ the ordering and the traps are the same everywhere.
 
 ## 1. What you are building
 
-One VPS, one hostname, four moving parts. Three of them are containers; two more (nginx and
+One VPS, one hostname, six moving parts. Four of them are containers; two more (nginx and
 PostgreSQL) are installed directly on the host.
 
 ```
-                          internet
-                             │
-                             │ :80 → 301 → :443
-                             ▼
-                   ┌───────────────────┐
-                   │  nginx  (host)    │   TLS terminates here
-                   └─────────┬─────────┘
-        ┌────────────────────┼────────────────────┐
-        │                    │                    │
-   /ui/ │              /api/ │              /auth/│
-        ▼                    ▼                    ▼
-  127.0.0.1:8081       127.0.0.1:8082       127.0.0.1:8083
-  ┌──────────┐         ┌──────────┐         ┌──────────┐
-  │    ui    │         │   api    │         │   auth   │   docker compose
-  │  nginx + │         │  Spring  │         │ Keycloak │   network 172.20.0.0/16
-  │  Angular │         │   Boot   │         │   26.0   │
-  └──────────┘         └────┬─────┘         └────┬─────┘
-                            │                    │
-                            └────────┬───────────┘
+                                  internet
+                                     │
+                                     │ :80 → 301 → :443
                                      ▼
-                          ┌────────────────────┐
-                          │ PostgreSQL (host)  │
-                          │  db: planelyx      │
-                          │  db: keycloak      │
-                          └────────────────────┘
+                           ┌───────────────────┐
+                           │  nginx  (host)    │   TLS terminates here
+                           └─────────┬─────────┘
+        ┌────────────────────┬───────┴────────────┬────────────────────┐
+        │                    │                    │                    │
+   /ui/ │              /api/ │              /auth/│               /ocr/│
+        ▼                    ▼                    ▼                    ▼
+  127.0.0.1:8081       127.0.0.1:8082       127.0.0.1:8083       127.0.0.1:8084
+  ┌──────────┐         ┌──────────┐         ┌──────────┐         ┌──────────┐
+  │    ui    │         │   api    │         │   auth   │         │   ocr    │
+  │  nginx + │         │  Spring  │         │ Keycloak │         │  Fastify │
+  │  Angular │         │   Boot   │         │   26.0   │         │ Node 24  │
+  └──────────┘         └────┬─────┘         └────┬─────┘         └────┬─────┘
+                            │                    │                    │
+                            │         docker compose network 172.20.0.0/16
+                            └────────────────────┼────────────────────┘
+                                                 ▼
+                                      ┌────────────────────┐
+                                      │ PostgreSQL (host)  │
+                                      │  db: planelyx      │
+                                      │  db: keycloak      │
+                                      │  db: planelyx_ocr  │
+                                      └────────────────────┘
 ```
+
+`ocr` is the only container holding state of its own: the uploaded statements, encrypted, in a
+Docker volume — plus the key that decrypts them in a second volume. Everything under
+[§15](#15-operations) about backing up the two databases together applies to those volumes too,
+and the key is the one item on this box that no reprocessing can regenerate.
 
 Routing, for reference:
 
@@ -79,6 +86,7 @@ https://planelyx.com/       →  302 to /ui/
 https://planelyx.com/ui/    →  Angular SPA
 https://planelyx.com/api/   →  Spring Boot
 https://planelyx.com/auth/  →  Keycloak
+https://planelyx.com/ocr/   →  statement ingestion (Fastify)
 ```
 
 ### Why nginx and Postgres live on the host
@@ -138,20 +146,21 @@ request.
 ### Off the box
 
 - **A registered domain** — `planelyx.com` — with access to its DNS records.
-- **A GCP project** with an Artifact Registry Docker repository. All three `release.yml`
-  workflows push to region `southamerica-east1`, repository `docker-remote-repo`, so the
+- **A GCP project** with an Artifact Registry Docker repository. All four `release.yml`
+  workflows push to region `southamerica-east1`, repository `planelyx`, so the
   full image paths are:
   ```
-  southamerica-east1-docker.pkg.dev/PROJECT_ID/docker-remote-repo/api
-  southamerica-east1-docker.pkg.dev/PROJECT_ID/docker-remote-repo/ui
-  southamerica-east1-docker.pkg.dev/PROJECT_ID/docker-remote-repo/auth
+  southamerica-east1-docker.pkg.dev/PROJECT_ID/planelyx/api
+  southamerica-east1-docker.pkg.dev/PROJECT_ID/planelyx/ui
+  southamerica-east1-docker.pkg.dev/PROJECT_ID/planelyx/auth
+  southamerica-east1-docker.pkg.dev/PROJECT_ID/planelyx/ocr
   ```
   São Paulo keeps pulls fast if the VPS is in Brazil.
 - **Two service accounts**, not one:
 
   | Account | Role | Key lives in |
   |---|---|---|
-  | CI pusher | `roles/artifactregistry.writer` | GitHub secret `GCP_SA_KEY` in all three repos |
+  | CI pusher | `roles/artifactregistry.writer` | GitHub secret `GCP_SA_KEY` in all four repos |
   | VPS puller | `roles/artifactregistry.reader` | the VPS only |
 
   Do not reuse the CI key on the VPS. A read-only key on a box exposed to the internet
@@ -253,7 +262,7 @@ $ sudo ufw enable
 $ sudo ufw status verbose
 ```
 
-Three ports open to the world. The three container ports (8081–8083) are deliberately
+Three ports open to the world. The four container ports (8081–8084) are deliberately
 absent — they bind loopback and are reached only through nginx.
 
 ### ⚠️ Postgres needs one more rule, or nothing will start
@@ -445,7 +454,7 @@ $ sudo systemctl enable docker
 
 ## 7. PostgreSQL
 
-One server, two databases, two roles. This is the step with the most ways to go subtly
+One server, three databases, three roles. This is the step with the most ways to go subtly
 wrong, so it is worth going slowly.
 
 ### Roles and databases
@@ -460,37 +469,53 @@ CREATE DATABASE planelyx OWNER planelyx_app;
 
 CREATE ROLE keycloak LOGIN PASSWORD '<kc-password>';
 CREATE DATABASE keycloak OWNER keycloak;
+
+CREATE ROLE planelyx_ocr LOGIN PASSWORD '<ocr-password>';
+CREATE DATABASE planelyx_ocr OWNER planelyx_ocr;
 \q
 ```
 
-Generate both passwords properly and store them where you will find them again:
+Generate all three passwords properly and store them where you will find them again:
 
 ```bash
 $ openssl rand -base64 32
 ```
 
-**Two roles, not one.** The API's tables and Keycloak's tables have completely different
-threat profiles: Keycloak's `credential` table holds password hashes. If the API is ever
-compromised, its database credential should not be a path to the identity store.
+**Three roles, not one.** The three sets of tables have completely different threat profiles:
+Keycloak's `credential` table holds password hashes, and `planelyx-ocr` is the only service that
+accepts uploaded files from the internet. If any one of them is compromised, its database
+credential must not be a path to the other two.
+
+> **`planelyx_ocr` has to exist before the first deploy of that service.** It can create its own
+> database when it is missing, but only from a role permitted to `CREATE DATABASE` — which this
+> one deliberately is not. Provisioned here, that branch is never reached. Skip it and the deploy
+> fails in its migration step with a missing-database error reported against drizzle's
+> `CREATE SCHEMA`, which points at a schema rather than at the database that is not there.
 
 PostgreSQL 14+ defaults `password_encryption` to `scram-sha-256`, so the roles above are
 already SCRAM. Verify rather than assume:
 
 ```sql
 SELECT rolname, LEFT(rolpassword, 14) FROM pg_authid
- WHERE rolname IN ('planelyx_app','keycloak');
--- both must start with SCRAM-SHA-256
+ WHERE rolname IN ('planelyx_app','keycloak','planelyx_ocr');
+-- all three must start with SCRAM-SHA-256
 ```
 
-### ⚠️ The two databases are one logical unit
+### ⚠️ The three databases are one logical unit
 
 The API's multi-tenancy key is `owner_id`, populated from the Keycloak user's `sub` claim
 (`src/main/java/com/planelyx/api/security/CurrentUser.java`). Every row in `planelyx` is
-meaningless without the matching user in `keycloak`.
+meaningless without the matching user in `keycloak`. `planelyx_ocr` keys its documents the same
+way, and its confirmed rows carry the id of the ledger transaction they produced in `planelyx`.
 
 Back them up **in the same job**, restore them **together**, and never restore one from a
 different point in time than the other. A partial restore is a data-loss event that will
 present as users logging in to an empty account. See [§15](#15-operations).
+
+Restoring `planelyx_ocr` older than `planelyx` has a failure of its own: a document it believes
+is unconfirmed has in fact already been written to the ledger, so confirming it again files every
+transaction on it twice. There is no constraint that stops this — the duplicate is a legitimate
+row as far as the API is concerned.
 
 ### Letting the containers connect
 
@@ -508,8 +533,9 @@ listen_addresses = '*'
 
 ```conf
 # Compose containers. The subnet must match the ipam block in compose.prod.yaml.
-host  planelyx  planelyx_app  172.20.0.0/16  scram-sha-256
-host  keycloak  keycloak      172.20.0.0/16  scram-sha-256
+host  planelyx      planelyx_app  172.20.0.0/16  scram-sha-256
+host  keycloak      keycloak      172.20.0.0/16  scram-sha-256
+host  planelyx_ocr  planelyx_ocr  172.20.0.0/16  scram-sha-256
 ```
 
 Pinning the Compose subnet (rather than accepting whatever `172.17.x` Docker hands out) is
@@ -817,6 +843,8 @@ location /ui/   { proxy_pass http://127.0.0.1:8081; include .../planelyx-proxy.c
 location /api/  { proxy_pass http://127.0.0.1:8082; include .../planelyx-proxy.conf; }
 location /auth/ { proxy_pass http://127.0.0.1:8083; include .../planelyx-proxy.conf;
                   proxy_buffer_size 128k; proxy_buffers 4 256k; }
+location /ocr/  { proxy_pass http://127.0.0.1:8084; include .../planelyx-proxy.conf;
+                  client_max_body_size 25m; proxy_read_timeout 120s; }
 
 location /actuator    { return 404; }
 location /v3/api-docs { return 404; }
@@ -951,18 +979,20 @@ $ nano .env
 | Key | Value |
 |---|---|
 | `REGISTRY` | `southamerica-east1-docker.pkg.dev/PROJECT_ID/docker-remote-repo` |
-| `API_TAG` / `UI_TAG` / `AUTH_TAG` | the commit SHAs from the three green CI runs |
+| `API_TAG` / `UI_TAG` / `AUTH_TAG` / `OCR_TAG` | the commit SHAs from the four green CI runs |
 | `APP_DB_PASSWORD` | the `planelyx_app` password from [§7](#7-postgresql) |
 | `KC_DB_PASSWORD` | the `keycloak` password from [§7](#7-postgresql) |
+| `OCR_DB_PASSWORD` | the `planelyx_ocr` password from [§7](#7-postgresql) |
 | `KC_ADMIN` / `KC_ADMIN_PASSWORD` | freshly generated |
 
 Two rules, both worth being pedantic about:
 
-- **`REGISTRY` must match what CI pushed to.** All three `release.yml` workflows use
-  `REPOSITORY: docker-remote-repo`. Point `REGISTRY` anywhere else and the pull hits a path
-  that has never been written to.
+- **`REGISTRY` must match what CI pushed to.** All four `release.yml` workflows use
+  `REPOSITORY: planelyx`, which is also what `deploy.yml` renders into `.env` from
+  [§13](#13-the-deploy-workflow) onwards. Point `REGISTRY` anywhere else and the pull hits a
+  path that has never been written to.
 - **Pin SHAs, never `latest`.** `latest` makes a redeploy non-reproducible and turns
-  rollback into guesswork. With SHAs pinned, rollback is editing three lines.
+  rollback into guesswork. With SHAs pinned, rollback is editing four lines.
 
 Every credential must be freshly generated. None of the local development values
 (`planelyx`/`planelyx`, `admin`/`admin`) may reach this file.
@@ -1132,15 +1162,23 @@ In `planelyx-infra` → Settings → Secrets and variables → Actions:
 | `VPS_USER` | `deploy` |
 | `VPS_SSH_KEY` | contents of `~/.ssh/planelyx-deploy` (the private half) |
 | `VPS_SSH_KNOWN_HOSTS` | the `ssh-keyscan` output above |
-| `GCP_PROJECT_ID` | same value as in the three service repos |
+| `GCP_PROJECT_ID` | same value as in the four service repos |
 | `APP_DB_PASSWORD` | the `planelyx_app` role's password, from [§7](#7-postgresql) |
 | `KC_DB_PASSWORD` | the `keycloak` role's password |
+| `OCR_DB_PASSWORD` | the `planelyx_ocr` role's password |
 | `KC_ADMIN` | Keycloak bootstrap admin username |
 | `KC_ADMIN_PASSWORD` | Keycloak bootstrap admin password |
 | `KEYCLOAK_ADMIN_CLIENT_SECRET` | secret of the `planelyx-api-admin` client — **read out of the Keycloak admin console**, not generated |
 | `PLANELYX_PROVISIONING_SECRET` | signs Keycloak's "a user registered" callback to the API; generate with `openssl rand -hex 32` |
 
-The last six must **byte-match what is in `.env` on the box right now**. The workflow
+> ⚠️ **Adding `OCR_DB_PASSWORD` to a stack that is already running is a one-off.** The `.env`
+> on the box predates the key, so the drift check reads it back empty and refuses — and
+> `OCR_TAG` cannot be carried forward from a file that has never contained it. That first run
+> therefore needs both an ocr tag **and** *Allow DB/Keycloak credentials to differ* ticked, with
+> the `planelyx_ocr` role already created in [§7](#7-postgresql) using that exact password. Both
+> checks are behaving correctly here; every run afterwards is ordinary.
+
+The last seven must **byte-match what is in `.env` on the box right now**. The workflow
 compares them before it deploys and refuses to continue if they differ, precisely so a
 mismatch surfaces here rather than weeks later, when an unrelated deploy recreates a container
 with a password Postgres rejects.
@@ -1210,7 +1248,23 @@ $ curl -sI http://planelyx.com/                  # 301 → https
 $ curl -sI https://www.planelyx.com/             # 301 → https://planelyx.com/
 $ curl -sI https://planelyx.com/actuator/health  # 404 from nginx
 $ curl -sI https://planelyx.com/swagger-ui.html  # 404 from nginx
+$ curl -sI https://planelyx.com/ocr/documents    # 401 — proxied and rejecting anonymous
 ```
+
+That last one is the check worth being precise about: **401 is the pass condition.** A 404
+means the `location /ocr/` block is missing from the host nginx config — the containers are
+shipped by the workflow, but nginx is not, so it is the one piece that a deploy cannot install
+for you. A 502 means the container is not up.
+
+The service's own health endpoint is deliberately not reachable from the internet; check it
+from the box:
+
+```bash
+$ curl -s http://127.0.0.1:8084/ocr/healthz      # {"status":"ok"}
+```
+
+It queries the database rather than only proving the process is alive, so a 503 here is a
+`planelyx_ocr` credential or `pg_hba.conf` problem, not a dead container.
 
 ### 3. The host-gateway hairpin
 
@@ -1292,23 +1346,32 @@ $ docker compose -f compose.prod.yaml down
 $ docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300
 ```
 
-Log back in and confirm your user and data are still there. Both databases live on the host,
-so nothing should be lost — this check exists to prove that, not to hope it.
+Log back in and confirm your user and data are still there. All three databases live on the
+host, so nothing should be lost — this check exists to prove that, not to hope it.
+
+`ocr` is the one service whose state is *not* on the host: its documents and its encryption key
+are Docker volumes. `down` leaves them alone; `down -v` destroys them, and no reprocessing can
+recover a document whose key is gone. Confirm they survived:
+
+```bash
+$ docker volume ls | grep planelyx
+# planelyx_ocr-data and planelyx_ocr-keys must both still be listed
+```
 
 ### 8. Port bindings
 
 ```bash
-$ sudo ss -tlnp | grep -E '808[123]|5432'
+$ sudo ss -tlnp | grep -E '808[1234]|5432'
 ```
 
-Every **container** port (8081–8083) must be bound to `127.0.0.1`. Anything else there on
+Every **container** port (8081–8084) must be bound to `127.0.0.1`. Anything else there on
 `0.0.0.0` is exposed to the internet. Postgres on `*:5432` is expected — it is kept private
 by the ufw rule and `pg_hba.conf` rather than by its bind address ([§7](#7-postgresql)).
 Confirm that from off-box, which is the only test that counts:
 
 ```bash
 # from your workstation, not the VPS
-$ nmap -Pn -p 22,80,443,5432,8081,8082,8083 <VPS public IP>
+$ nmap -Pn -p 22,80,443,5432,8081,8082,8083,8084 <VPS public IP>
 # 22/80/443 open; everything else filtered or closed
 ```
 
@@ -1372,27 +1435,53 @@ ALTER DEFAULT PRIVILEGES FOR ROLE planelyx_app IN SCHEMA public
 
 ### Backups
 
-The single most important operational task. Both databases, one job, off the box.
+The single most important operational task. All three databases, one job, off the box.
 
 ```bash
 $ sudo tee /usr/local/bin/planelyx-backup.sh > /dev/null <<'EOF'
 #!/usr/bin/env bash
-# Dumps both databases into one timestamped directory. They are one logical unit:
-# planelyx.owner_id references Keycloak `sub` values, so a partial restore loses data.
+# Dumps all three databases into one timestamped directory. They are one logical unit:
+# planelyx.owner_id references Keycloak `sub` values, planelyx_ocr keys its documents the same
+# way and records the ledger ids it produced, so a partial restore loses data.
 set -euo pipefail
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 DEST="/var/backups/planelyx/$STAMP"
 mkdir -p "$DEST"
+# 700 because the ocr master key is copied in below. Everything here is sensitive, but that
+# file is a decryption key sitting next to the data it decrypts.
+chmod 700 "$DEST"
 
-sudo -u postgres pg_dump -Fc planelyx  > "$DEST/planelyx.dump"
-sudo -u postgres pg_dump -Fc keycloak  > "$DEST/keycloak.dump"
+sudo -u postgres pg_dump -Fc planelyx      > "$DEST/planelyx.dump"
+sudo -u postgres pg_dump -Fc keycloak      > "$DEST/keycloak.dump"
+sudo -u postgres pg_dump -Fc planelyx_ocr  > "$DEST/planelyx_ocr.dump"
+
+# The ocr master key: 32 bytes, and the only thing on this box that nothing can regenerate.
+# Every stored statement is encrypted with it, so losing it destroys them all — including the
+# ones a database restore would otherwise bring back. Copied on every run because it is
+# effectively free; it is written once on first boot and does not change.
+docker run --rm -v planelyx_ocr-keys:/keys:ro -v "$DEST":/out alpine \
+    cp /keys/master.key /out/ocr-master.key
 
 # Keep 14 days locally. Off-box copy is what actually protects you.
 find /var/backups/planelyx -maxdepth 1 -type d -mtime +14 -exec rm -rf {} +
 EOF
 $ sudo chmod +x /usr/local/bin/planelyx-backup.sh
 ```
+
+> ⚠️ **The documents themselves are not in this job.** `planelyx_ocr-data` holds the encrypted
+> originals and grows without bound, so it does not belong in a nightly rotation that keeps 14
+> full copies. Back it up on its own schedule — it is append-only, which makes it a good fit for
+> `restic` or `rclone sync` rather than repeated tarballs:
+>
+> ```bash
+> $ docker run --rm -v planelyx_ocr-data:/data:ro -v /var/backups:/out alpine \
+>     tar czf /out/ocr-data.tar.gz -C /data .
+> ```
+>
+> Losing it is recoverable in a way losing the key is not: the ledger keeps the confirmed
+> transactions, and what is lost is the ability to re-read an original — which for receipts is
+> permanent past roughly 180 days, when SEFAZ stops serving them.
 
 Schedule it:
 
@@ -1440,9 +1529,10 @@ $ sudo -u postgres psql -d planelyx_restore_test -c '\dt'
 $ sudo -u postgres dropdb planelyx_restore_test
 ```
 
-Note what a real restore means: **both** databases, from the **same** timestamp. Restoring
+Note what a real restore means: **all three** databases, from the **same** timestamp. Restoring
 `planelyx` against an older `keycloak` orphans rows whose `owner_id` no longer matches any
-user.
+user; restoring `planelyx_ocr` older than `planelyx` re-offers documents that were already
+filed, and confirming one of those writes every transaction on it to the ledger a second time.
 
 ### Deploying a new release
 
@@ -1481,10 +1571,23 @@ $ docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300 --remove-o
 $ docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300 --no-deps api
 ```
 
-`--no-deps` is what keeps a single-service deploy from restarting the other two. Never use it
-on the whole stack: it drops dependency edges outright, so `up --no-deps ui api auth` starts
+`--no-deps` is what keeps a single-service deploy from restarting the other three. Never use it
+on the whole stack: it drops dependency edges outright, so `up --no-deps ui api auth ocr` starts
 `api` without waiting for `auth` to be healthy, and `api` resolves the OIDC metadata at
 startup.
+
+⚠️ **Bringing up `ocr` by hand means running its migrations by hand.** Unlike `api`, which runs
+Flyway on its way to reporting healthy, this service does not migrate at startup — the deploy
+workflow does it, and driving Compose directly skips that step. The new container then serves
+against the previous schema and fails on whichever query touches a column that does not exist
+yet. Before `up`, from the image you are deploying:
+
+```bash
+$ docker compose -f compose.prod.yaml run --rm ocr node dist/storage/migrate.js
+```
+
+It dumps the database into the `ocr-data` volume before touching anything and aborts if it
+cannot, which is why the image carries `pg_dump`.
 
 Anything you change in `compose.prod.yaml` on the box is overwritten by the next workflow run,
 which ships its own copy. Real changes go in the repo.
@@ -1598,7 +1701,7 @@ $ curl -s https://planelyx.com/auth/realms/planelyx/.well-known/openid-configura
 ```
 22, 80, 443     public (ufw allow)
 5432            listen_addresses='*'; kept private by ufw (172.20.0.0/16 only) + pg_hba
-8081/8082/8083  127.0.0.1 only — ui / api / auth
+8081–8084      127.0.0.1 only — ui / api / auth / ocr
 9000            inside the auth container only — Keycloak management + health
 ```
 

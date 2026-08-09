@@ -1,19 +1,21 @@
 # planelyx-infra
 
-Planelyx is a personal-finance application. It is split across four repositories — a Spring
-Boot API, an Angular SPA, a Keycloak image carrying the realm and login theme, and this one,
-which is the deployment layer. Everything that lives on the VPS is here: the production
-Compose stack and the host nginx config. It builds nothing, and the VPS holds no checkout of
-it — the deploy workflow ships `compose.prod.yaml` to the box from the commit being deployed.
+Planelyx is a personal-finance application. It is split across five repositories — a Spring
+Boot API, an Angular SPA, a Keycloak image carrying the realm and login theme, a statement
+ingestion service, and this one, which is the deployment layer. Everything that lives on the
+VPS is here: the production Compose stack and the host nginx config. It builds nothing, and the
+VPS holds no checkout of it — the deploy workflow ships `compose.prod.yaml` to the box from the
+commit being deployed.
 
 The whole system runs on a single VPS. GitHub Actions builds each service and pushes it to
 GCP Artifact Registry; the VPS pulls those images into a Compose stack that sits behind a
-host-installed nginx, with all three services routed by path under one hostname.
+host-installed nginx, with all four services routed by path under one hostname.
 
 ```
 planelyx-api    Spring Boot, JWT resource server        ->  /api/
 planelyx-ui     Angular SPA served by nginx             ->  /ui/
 planelyx-auth   Keycloak image (realm + login theme)    ->  /auth/
+planelyx-ocr    Fastify, card-statement ingestion       ->  /ocr/
 planelyx-infra  this repo — Compose, nginx, deploy workflow
 ```
 
@@ -32,7 +34,7 @@ real time, not just the happy path.
 ## Layout
 
 ```
-compose.prod.yaml            ui / api / auth, all bound to 127.0.0.1; shipped to the VPS per deploy
+compose.prod.yaml            ui / api / auth / ocr, all bound to 127.0.0.1; shipped to the VPS per deploy
 .github/workflows/deploy.yml the whole deploy: ships compose, renders .env, pulls, up -d, verifies
 .env.example                 reference only — the workflow renders the real .env on every run
 nginx/planelyx.conf          -> /etc/nginx/sites-available/planelyx
@@ -41,7 +43,7 @@ nginx/snippets/planelyx-proxy.conf -> /etc/nginx/snippets/
 
 ## Topology
 
-nginx and Postgres are installed on the host. The three containers publish only on
+nginx and Postgres are installed on the host. The four containers publish only on
 `127.0.0.1`, so the sole route in from the internet is host nginx on 443.
 
 ```
@@ -50,10 +52,15 @@ nginx and Postgres are installed on the host. The three containers publish only 
         /ui/  -> 127.0.0.1:8081   ui        (nginx + static Angular)
         /api/ -> 127.0.0.1:8082   api       (Spring Boot)
         /auth/-> 127.0.0.1:8083   auth      (Keycloak)
+        /ocr/ -> 127.0.0.1:8084   ocr       (Fastify, Node 24)
                             |
                     host postgres :5432
-                    databases: planelyx, keycloak
+                    databases: planelyx, keycloak, planelyx_ocr
 ```
+
+`ocr` is the only service with state outside Postgres: two Docker volumes, one holding the
+uploaded statements encrypted at rest and one holding the key that decrypts them. `down -v`
+destroys both, and nothing can regenerate the key. See `VPS_SETUP.md` §15.
 
 ## Deploying
 
@@ -87,8 +94,12 @@ cd ~/planelyx-infra
 docker compose -f compose.prod.yaml pull
 docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300 --remove-orphans
 
-# one service only — --no-deps keeps it from restarting ui and auth
+# one service only — --no-deps keeps it from restarting the others
 docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300 --no-deps api
+
+# ocr does not migrate at startup the way api does; the deploy workflow runs this for you,
+# and driving Compose by hand does not
+docker compose -f compose.prod.yaml run --rm ocr node dist/storage/migrate.js
 ```
 
 The tags come from `.env`. Editing them by hand works, but the next workflow run reconciles
