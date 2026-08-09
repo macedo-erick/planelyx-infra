@@ -1,6 +1,6 @@
 name: deploy
 
-# Deploys any subset of the three services to the VPS over SSH.
+# Deploys any subset of the four services to the VPS over SSH.
 #
 # A service is touched only if you give it a tag. Everything else keeps the tag it is
 # already running: the workflow reads the current tags off the VPS and carries them forward,
@@ -15,6 +15,19 @@ name: deploy
 # `.env` on the VPS is rendered from the secrets below on every run. That makes GitHub the
 # source of truth for those credentials — a value hand-edited on the box is reverted by the
 # next deploy. The drift check exists so that reversion can never happen silently.
+#
+# ⚠️ THE FIRST RUN AFTER `ocr` WAS ADDED IS A ONE-OFF. A VPS whose `.env` predates it has
+# neither `OCR_TAG` nor `OCR_DB_PASSWORD`, so both of this workflow's safety nets fire on
+# values that are simply not there yet:
+#
+#   - `OCR_TAG` cannot be carried forward from a file that does not contain it, so that run
+#     must supply an ocr tag rather than leaving the box blank.
+#   - `OCR_DB_PASSWORD` reads back empty and registers as drift, so that run must also tick
+#     "Allow DB/Keycloak credentials to differ".
+#
+# Both are the checks working correctly on a genuinely new key, not something to route around.
+# Create the `planelyx_ocr` role first (VPS_SETUP.md §7) — the password in the repo secret has
+# to be one Postgres already accepts. Every run after that is ordinary.
 
 on:
   workflow_dispatch:
@@ -29,6 +42,10 @@ on:
         default: ''
       auth_tag:
         description: 'Keycloak image tag (commit SHA) — leave blank to leave Keycloak untouched'
+        type: string
+        default: ''
+      ocr_tag:
+        description: 'OCR image tag (commit SHA) — leave blank to leave the OCR service untouched'
         type: string
         default: ''
       allow_secret_change:
@@ -46,7 +63,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Mirrors the three service repos' release.yml, which push to this same path.
+  # Mirrors the four service repos' release.yml, which push to this same path.
   REGION: southamerica-east1
   REPOSITORY: planelyx
   VPS_PATH: planelyx-infra
@@ -84,9 +101,11 @@ jobs:
           API_TAG: ${{ inputs.api_tag }}
           UI_TAG: ${{ inputs.ui_tag }}
           AUTH_TAG: ${{ inputs.auth_tag }}
+          OCR_TAG: ${{ inputs.ocr_tag }}
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           APP_DB_PASSWORD: ${{ secrets.APP_DB_PASSWORD }}
           KC_DB_PASSWORD: ${{ secrets.KC_DB_PASSWORD }}
+          OCR_DB_PASSWORD: ${{ secrets.OCR_DB_PASSWORD }}
           KC_ADMIN: ${{ secrets.KC_ADMIN }}
           KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
@@ -96,7 +115,7 @@ jobs:
           fail=0
           services=()
 
-          for svc in api ui auth; do
+          for svc in api ui auth ocr; do
               upper=${svc^^}
               tag_var="${upper}_TAG"
               tag=${!tag_var}
@@ -113,7 +132,7 @@ jobs:
           done
 
           if (( fail == 0 )) && (( ${#services[@]} == 0 )); then
-              echo "::error::No service selected. Give the commit SHA of at least one service (the service repo's release run prints it as 'API_TAG=...', 'UI_TAG=...' or 'AUTH_TAG=...')."
+              echo "::error::No service selected. Give the commit SHA of at least one service (the service repo's release run prints it as 'API_TAG=...', 'UI_TAG=...', 'AUTH_TAG=...' or 'OCR_TAG=...')."
               fail=1
           fi
 
@@ -122,7 +141,7 @@ jobs:
           # rendered single-quoted because that is the only form Compose leaves un-interpolated
           # (see the $-truncation warning in .env.example), so this is a hard constraint rather
           # than a style rule. `openssl rand -base64 32` never emits ' or $.
-          for name in GCP_PROJECT_ID APP_DB_PASSWORD KC_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET; do
+          for name in GCP_PROJECT_ID APP_DB_PASSWORD KC_DB_PASSWORD OCR_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET; do
               value=${!name}
               if [[ -z $value ]]; then
                   echo "::error::Repo secret $name is empty or not set."
@@ -188,6 +207,7 @@ jobs:
           IN_API_TAG: ${{ inputs.api_tag }}
           IN_UI_TAG: ${{ inputs.ui_tag }}
           IN_AUTH_TAG: ${{ inputs.auth_tag }}
+          IN_OCR_TAG: ${{ inputs.ocr_tag }}
         run: |
           set -euo pipefail
 
@@ -218,14 +238,14 @@ jobs:
           fail=0
           carried=()
 
-          for svc in api ui auth; do
+          for svc in api ui auth ocr; do
               upper=${svc^^}
               input_var="IN_${upper}_TAG"
 
               if [[ " $SELECTED " == *" $svc "* ]]; then
                   resolved=${!input_var}
               elif [[ $env_exists == no ]]; then
-                  echo "::error::First deploy: no .env exists on the VPS yet, so all three tags must be supplied. '$svc' was left blank."
+                  echo "::error::First deploy: no .env exists on the VPS yet, so all four tags must be supplied. '$svc' was left blank."
                   fail=1
                   continue
               else
@@ -257,6 +277,7 @@ jobs:
         env:
           APP_DB_PASSWORD: ${{ secrets.APP_DB_PASSWORD }}
           KC_DB_PASSWORD: ${{ secrets.KC_DB_PASSWORD }}
+          OCR_DB_PASSWORD: ${{ secrets.OCR_DB_PASSWORD }}
           KC_ADMIN: ${{ secrets.KC_ADMIN }}
           KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
@@ -281,7 +302,7 @@ jobs:
 
           fail=0
 
-          for name in APP_DB_PASSWORD KC_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET; do
+          for name in APP_DB_PASSWORD KC_DB_PASSWORD OCR_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET; do
               on_vps=$(read_env_key "$name")
               if [[ $on_vps != "${!name}" ]]; then
                   echo "::error::Secret drift: $name differs between the repo secret and the VPS .env. If this is a deliberate rotation, re-run with 'Allow DB/Keycloak credentials to differ' ticked — and make sure the Postgres role was changed to match."
@@ -290,7 +311,7 @@ jobs:
           done
 
           (( fail == 0 )) || exit 1
-          echo "No drift: the six credentials match what the VPS is already using."
+          echo "No drift: the seven credentials match what the VPS is already using."
 
       # ------------------------------------------------------------------ deploy ----
       # Staged, not installed. The pull below is what proves the tags exist in Artifact
@@ -301,6 +322,7 @@ jobs:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           APP_DB_PASSWORD: ${{ secrets.APP_DB_PASSWORD }}
           KC_DB_PASSWORD: ${{ secrets.KC_DB_PASSWORD }}
+          OCR_DB_PASSWORD: ${{ secrets.OCR_DB_PASSWORD }}
           KC_ADMIN: ${{ secrets.KC_ADMIN }}
           KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
@@ -308,6 +330,7 @@ jobs:
           API_TAG: ${{ steps.current.outputs.api_tag }}
           UI_TAG: ${{ steps.current.outputs.ui_tag }}
           AUTH_TAG: ${{ steps.current.outputs.auth_tag }}
+          OCR_TAG: ${{ steps.current.outputs.ocr_tag }}
         run: |
           set -euo pipefail
           umask 077
@@ -322,8 +345,10 @@ jobs:
               printf 'API_TAG=%s\n' "$API_TAG"
               printf 'UI_TAG=%s\n' "$UI_TAG"
               printf 'AUTH_TAG=%s\n' "$AUTH_TAG"
+              printf 'OCR_TAG=%s\n' "$OCR_TAG"
               printf "APP_DB_PASSWORD='%s'\n" "$APP_DB_PASSWORD"
               printf "KC_DB_PASSWORD='%s'\n" "$KC_DB_PASSWORD"
+              printf "OCR_DB_PASSWORD='%s'\n" "$OCR_DB_PASSWORD"
               printf "KC_ADMIN='%s'\n" "$KC_ADMIN"
               printf "KC_ADMIN_PASSWORD='%s'\n" "$KC_ADMIN_PASSWORD"
               printf "KEYCLOAK_ADMIN_CLIENT_SECRET='%s'\n" "$KEYCLOAK_ADMIN_CLIENT_SECRET"
@@ -345,7 +370,7 @@ jobs:
           set -euo pipefail
           # Both staged: this is the last step that can fail without having changed anything the
           # running stack reads. --env-file suppresses the default .env, which is why the staged
-          # file has to carry all ten keys rather than a delta. The project name comes from
+          # file has to carry all twelve keys rather than a delta. The project name comes from
           # `name: planelyx` inside the compose file, so the staged file and the installed one
           # address the same project.
           ssh $SSH_OPTS "$REMOTE" \
@@ -387,16 +412,37 @@ jobs:
               docker compose -f "$COMPOSE" logs --tail 50 "${services[@]}" >&2 || true
           }
 
+          # planelyx-ocr migrates its own database, and — unlike api, which runs Flyway on the way
+          # to reporting healthy — it does not do so at startup. Something has to, or the new
+          # container serves against the previous schema and fails on whichever query touches a
+          # column that does not exist yet. So it runs here, from the image being deployed, before
+          # `up` replaces anything.
+          #
+          # `run --rm` and not `exec`: the container it would exec into is the *old* one, which
+          # carries the old migrations. `-T` because there is no TTY at the far end of this SSH.
+          # Service ports are not published for a `run` container, so this cannot collide with the
+          # instance still serving on 8084.
+          #
+          # The script takes its own pre-migration dump into the data volume first and aborts if
+          # it cannot (planelyx-ocr/src/storage/migrate.ts) — that is deliberate and must not be
+          # traded for a `--skip-backup` here: staged extractions lost to a bad migration can only
+          # be regenerated by reprocessing every original.
+          if [[ " ${services[*]} " == *" ocr "* ]]; then
+              echo "Applying planelyx-ocr migrations..."
+              docker compose -f "$COMPOSE" run --rm -T ocr node dist/storage/migrate.js \
+                  || { echo "error: planelyx-ocr migrations failed; the stack was not touched" >&2; exit 1; }
+          fi
+
           # `--wait` blocks until every service it touched is running|healthy and exits non-zero
           # otherwise.
           #
-          # Deploying all three takes the whole-stack path deliberately. `--no-deps` drops
+          # Deploying all four takes the whole-stack path deliberately. `--no-deps` drops
           # dependency edges outright — not just to services outside the selection — so
-          # `up --no-deps ui api auth` would start api without waiting for auth to be healthy,
+          # `up --no-deps ui api auth ocr` would start api without waiting for auth to be healthy,
           # and api resolves the OIDC metadata at startup. `--remove-orphans` also belongs only
           # here: it is a whole-stack statement, and scoping it to a subset risks classifying
           # the untouched services as orphans.
-          if (( ${#services[@]} == 3 )); then
+          if (( ${#services[@]} == 4 )); then
               docker compose -f "$COMPOSE" up -d --wait --wait-timeout "$wait_timeout" --remove-orphans \
                   || { dump_logs; exit 1; }
           else
@@ -495,6 +541,33 @@ jobs:
               fi
           fi
 
+          if [[ " $SELECTED " == *" ocr "* ]]; then
+              # /ocr/healthz is open — Compose's `--wait` and the image's own HEALTHCHECK both
+              # call it without a token — but nginx does not expose it, so this runs on the box.
+              # It answers 503 rather than failing to respond when the database is unreachable,
+              # which is the failure a wrong OCR_DB_PASSWORD produces.
+              health=$(ssh $SSH_OPTS "$REMOTE" \
+                  "curl -fsS --retry 5 --retry-delay 3 http://127.0.0.1:8084/ocr/healthz") || health=""
+              if [[ $health == *'"status":"ok"'* ]]; then
+                  echo "ocr: /ocr/healthz is ok (database reachable)"
+              else
+                  echo "::error::ocr: /ocr/healthz returned '${health:-unreachable}'."
+                  fail=1
+              fi
+
+              # Publicly, to prove nginx -> container -> token verification is wired end to end.
+              # 401 is the pass condition: 404 would mean the nginx location is missing, 502 that
+              # the container is not there.
+              code=$(curl -s -o /dev/null -w '%{http_code}' --retry 5 --retry-delay 3 \
+                  "$PUBLIC_URL/ocr/documents") || code="000"
+              if [[ $code == 401 ]]; then
+                  echo "ocr: $PUBLIC_URL/ocr/documents rejects anonymous callers with 401"
+              else
+                  echo "::error::ocr: $PUBLIC_URL/ocr/documents returned $code, expected 401."
+                  fail=1
+              fi
+          fi
+
           (( fail == 0 )) || exit 1
 
       # Covers a failed `up` *and* a failed smoke check: a step with `if: failure()` runs when
@@ -520,6 +593,7 @@ jobs:
           API_TAG: ${{ steps.current.outputs.api_tag }}
           UI_TAG: ${{ steps.current.outputs.ui_tag }}
           AUTH_TAG: ${{ steps.current.outputs.auth_tag }}
+          OCR_TAG: ${{ steps.current.outputs.ocr_tag }}
         run: |
           set -euo pipefail
           {
@@ -527,7 +601,7 @@ jobs:
               echo
               echo "| Service | Tag | |"
               echo "|---|---|---|"
-              for svc in api ui auth; do
+              for svc in api ui auth ocr; do
                   upper=${svc^^}
                   tag_var="${upper}_TAG"
                   tag=${!tag_var:-—}

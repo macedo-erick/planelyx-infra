@@ -132,3 +132,64 @@ services:
       retries: 20
       start_period: 45s
     logging: *logging
+
+  ocr:
+    image: ${REGISTRY:?REGISTRY is not set}/ocr:${OCR_TAG:?OCR_TAG is not set}
+    restart: unless-stopped
+    ports: ['127.0.0.1:8084:8080']
+    networks: [planelyx]
+    # Host Postgres. No `planelyx.com:host-gateway` entry, unlike `api`: this service takes its
+    # JWKS URL from configuration rather than deriving it from the issuer, so it never resolves
+    # the public hostname (see KEYCLOAK_JWKS_URI below).
+    extra_hosts: ['host.docker.internal:host-gateway']
+    environment:
+      DB_HOST: host.docker.internal
+      DB_PORT: '5432'
+      POSTGRES_DB: planelyx_ocr
+      POSTGRES_USER: planelyx_ocr
+      # Guarded rather than bare because the service's config schema rejects an empty password
+      # at startup, which would leave the container restart-looping on a validation error whose
+      # cause is a missing key in this file.
+      POSTGRES_PASSWORD: ${OCR_DB_PASSWORD:?OCR_DB_PASSWORD is not set}
+      # The service defaults to 127.0.0.1, which is right for a bare-metal run and unreachable
+      # here: inside the container that is the container's own loopback, so the published port
+      # would connect to nothing. Exposure is still limited — the publish above is loopback-only.
+      HTTP_HOST: 0.0.0.0
+      # Compared against the token's `iss` claim byte for byte, so it is the public URL.
+      KEYCLOAK_ISSUER_URI: https://planelyx.com/auth/realms/planelyx
+      # Where the keys are actually fetched from, which is deliberately *not* the issuer. Nothing
+      # is matched against this string, so it goes over the Compose network and skips the nginx
+      # hairpin `api` needs. The /auth prefix is KC_HTTP_RELATIVE_PATH, baked into the auth image.
+      KEYCLOAK_JWKS_URI: http://auth:8080/auth/realms/planelyx/protocol/openid-connect/certs
+      # Confirmed transactions are written here, forwarding the caller's own bearer token — there
+      # is no client credential to configure. Internal for the same reason as the JWKS URL.
+      PLANELYX_API_URL: http://api:8080/api
+      # nginx serves the UI and this service under one host, so no browser request to it is
+      # cross-origin. Left unset, which denies every cross-origin request outright.
+      #
+      # Originals are encrypted at rest under a key the service generates on first boot. Both
+      # paths are volumes below, and the key is deliberately not inside the data directory.
+      OCR_DATA_DIR: /app/data
+      OCR_MASTER_KEY_FILE: /app/keys/master.key
+      # Explicit rather than left to the default. This flag is the whole of what keeps financial
+      # documents from being sent to a third party, and a value that has to be read out of the
+      # image's defaults is one nobody can audit from this file.
+      OCR_LLM_ENABLED: 'false'
+    # Healthcheck is defined in the image itself (wget /ocr/healthz), and it queries the
+    # database rather than only the event loop — so `--wait` cannot roll forward onto a
+    # container that is up but cannot serve a request.
+    #
+    # No depends_on: JWKS and the ledger are both fetched lazily on the first request that needs
+    # them, so this service starts perfectly well before `auth` and `api` are ready.
+    volumes:
+      - ocr-data:/app/data
+      - ocr-keys:/app/keys
+    logging: *logging
+
+# ⚠️ `ocr-keys` is the one volume here whose loss is unrecoverable. Every document under
+# `ocr-data` is encrypted with the key inside it, so a backup of the data alone restores
+# nothing — they are separate volumes precisely so that a snapshot of one cannot be mistaken
+# for a backup. See VPS_SETUP.md §15.
+volumes:
+  ocr-data:
+  ocr-keys:

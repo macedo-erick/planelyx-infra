@@ -9,12 +9,27 @@ https://planelyx.com/      ->  302 to /ui/
 https://planelyx.com/ui/   ->  Angular SPA
 https://planelyx.com/api/  ->  Spring Boot
 https://planelyx.com/auth/ ->  Keycloak
+https://planelyx.com/ocr/  ->  statement ingestion (Fastify)
 ```
 
 **Architecture decisions:** path-based routing on one hostname; nginx and Postgres installed
-on the host; everything else in Compose bound to `127.0.0.1`; one Postgres server with two
-databases (`planelyx`, `keycloak`); a custom Keycloak image in its own repo carrying the
-realm export and login theme.
+on the host; everything else in Compose bound to `127.0.0.1`; one Postgres server with three
+databases (`planelyx`, `keycloak`, `planelyx_ocr`); a custom Keycloak image in its own repo
+carrying the realm export and login theme.
+
+> **`planelyx-ocr` arrived after this runbook was written**, so the phases below describe a
+> three-service stack. It changed nothing structural — same conventions, same registry, its own
+> database on the same server, and no Keycloak change at all, since it is a resource server
+> against the existing realm. What it added is recorded where it is operationally relevant
+> rather than as a phase of its own: the `ocr` service and its two volumes in
+> `compose.prod.yaml`, `location /ocr/` in `nginx/planelyx.conf`, `OCR_TAG` and
+> `OCR_DB_PASSWORD` in the deploy workflow, and the `planelyx_ocr` role, database and
+> `pg_hba.conf` line in `VPS_SETUP.md` §7.
+>
+> Two things about it genuinely differ from the three services below, both covered in
+> `VPS_SETUP.md`: it does **not** migrate its database at startup the way `api` runs Flyway —
+> the deploy does that explicitly — and it is the only container holding state of its own, in
+> volumes whose encryption key nothing can regenerate.
 
 ## What's built vs. what you run
 
