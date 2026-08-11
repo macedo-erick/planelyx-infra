@@ -1,21 +1,11 @@
-# Production stack for planelyx.com.
-#
-# nginx and Postgres live on the VPS host, not here. Every service binds to 127.0.0.1 so
-# the only way in from the internet is through the host nginx on 443.
 name: planelyx
 
 networks:
   planelyx:
     ipam:
       config:
-        # Fixed so pg_hba.conf can name it precisely instead of trusting a broad
-        # 172.16.0.0/12. Keep these two in step.
         - subnet: 172.20.0.0/16
 
-# A missing variable is only a *warning* to Compose — `${UI_TAG}` unset would render
-# `image: .../ui:` and reach the daemon as `invalid reference format`, far from the cause.
-# `:?` turns that into an immediate, named failure. `.github/workflows/deploy.yml` renders
-# this file's `.env`, so the guard is what stops a bad render from reaching production.
 services:
   ui:
     image: ${REGISTRY:?REGISTRY is not set}/ui:${UI_TAG:?UI_TAG is not set}
@@ -34,12 +24,7 @@ services:
     ports: ['127.0.0.1:8082:8080']
     networks: [planelyx]
     extra_hosts:
-      # Host Postgres.
       - 'host.docker.internal:host-gateway'
-      # The API validates JWTs by issuer, so it must fetch JWKS from the *public* issuer
-      # URL — that is the string inside the token's `iss` claim. Mapping the domain to the
-      # bridge gateway sends it straight to the host nginx instead of hairpinning out to
-      # the public IP and back. TLS still validates: the SNI hostname is genuine.
       - 'planelyx.com:host-gateway'
     environment:
       DB_HOST: host.docker.internal
@@ -47,30 +32,13 @@ services:
       POSTGRES_DB: planelyx
       POSTGRES_USER: planelyx_app
       POSTGRES_PASSWORD: ${APP_DB_PASSWORD}
-      # Must match the realm's issuer byte for byte, including the /auth prefix.
       KEYCLOAK_ISSUER_URI: https://planelyx.com/auth/realms/planelyx
-      # The other direction: the API calling Keycloak's Admin API to read and update the
-      # signed-in user's own profile (/me). Deliberately *not* the public issuer URL — no
-      # claim is matched here, so this goes over the compose network and skips the nginx
-      # hairpin. The /auth suffix is required: KC_HTTP_RELATIVE_PATH=/auth is baked into the
-      # auth image, and Spring appends request paths onto this base rather than replacing it.
       KEYCLOAK_SERVER_URL: http://auth:8080/auth
       KEYCLOAK_REALM: planelyx
       KEYCLOAK_ADMIN_CLIENT_ID: planelyx-api-admin
-      # Secret of the confidential planelyx-api-admin client, taken from the admin console.
-      # Guarded because an unset variable renders as empty, and Keycloak answers an empty
-      # secret with the same invalid_client 401 as a wrong one — indistinguishable from a
-      # genuinely bad credential, and a long way from the real cause.
       KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:?KEYCLOAK_ADMIN_CLIENT_SECRET is not set}
-      # Verifies the HMAC on Keycloak's "a user registered" callback, which is what seeds a new
-      # user's default categories. Guarded because an unset value renders as empty and every
-      # callback would then be rejected as unsigned — new accounts would arrive with no categories,
-      # nothing retries past ~20s, and there is no second trigger to recover from. The auth
-      # service is handed the same key, so signature and check cannot drift.
       PLANELYX_PROVISIONING_SECRET: ${PLANELYX_PROVISIONING_SECRET:?PLANELYX_PROVISIONING_SECRET is not set}
-      # Same-origin in production so CORS never fires, but a correct value costs nothing.
       PLANELYX_CORS_ORIGINS: https://planelyx.com
-    # Healthcheck is defined in the API image itself (curl /actuator/health).
     depends_on:
       auth:
         condition: service_healthy
@@ -87,38 +55,14 @@ services:
       KC_DB_URL: jdbc:postgresql://host.docker.internal:5432/keycloak
       KC_DB_USERNAME: keycloak
       KC_DB_PASSWORD: ${KC_DB_PASSWORD}
-      # Full public URL including the path. This is what makes tokens carry
-      # iss=https://planelyx.com/auth/realms/planelyx.
       KC_HOSTNAME: https://planelyx.com/auth
       KC_HTTP_ENABLED: 'true'
       KC_PROXY_HEADERS: xforwarded
-      # KC_DB, KC_HEALTH_ENABLED, KC_HTTP_RELATIVE_PATH and
-      # KC_HTTP_MANAGEMENT_RELATIVE_PATH are build-time options baked into the image by
-      # planelyx-auth/Dockerfile. `start --optimized` exits 2 if a runtime value differs
-      # from the baked one, so change them there and rebuild — never override them here.
-      # Renamed from KEYCLOAK_ADMIN in Keycloak 26. First boot only.
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_ADMIN}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
-      # Realm-import substitutions; resolved only on the very first boot.
       PLANELYX_UI_ORIGIN: https://planelyx.com
       PLANELYX_UI_BASE_URL: https://planelyx.com/ui
-      # Seeds the planelyx-api-admin client secret in planelyx-auth's realm export. The live
-      # realm already exists, so this changes nothing today — it matters on a rebuilt realm,
-      # where leaving it unset would not skip the client but create it with the export's
-      # `local-dev-secret` fallback: a publicly known credential holding manage-users here.
-      # Same value the api service receives as KEYCLOAK_ADMIN_CLIENT_SECRET; one .env key
-      # feeds both sides so the secret Keycloak stores and the one the API sends cannot drift.
       PLANELYX_KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:?KEYCLOAK_ADMIN_CLIENT_SECRET is not set}
-      # Read by the planelyx-provisioning event listener baked into the auth image. It posts over
-      # the Compose network rather than through nginx: /internal has no route from the internet,
-      # which is what keeps this unauthenticated endpoint private.
-      #
-      # `api` depends on `auth`, so this target is briefly unreachable at boot. That is fine — the
-      # listener retries at 1s, 4s and 15s — and the dependency must not be reversed, which would
-      # deadlock the stack. Unlike the variables above, these are read at runtime rather than at
-      # realm import, so they take effect on the existing realm. What does *not*: the realm must
-      # also list `planelyx-provisioning` under Event listeners, and --import-realm cannot add
-      # that to a realm that already exists. Set once by hand in the admin console.
       PLANELYX_PROVISIONING_URL: http://api:8080/internal/keycloak/user-registered
       PLANELYX_PROVISIONING_SECRET: ${PLANELYX_PROVISIONING_SECRET:?PLANELYX_PROVISIONING_SECRET is not set}
     healthcheck:
@@ -138,58 +82,25 @@ services:
     restart: unless-stopped
     ports: ['127.0.0.1:8084:8080']
     networks: [planelyx]
-    # Host Postgres. No `planelyx.com:host-gateway` entry, unlike `api`: this service takes its
-    # JWKS URL from configuration rather than deriving it from the issuer, so it never resolves
-    # the public hostname (see KEYCLOAK_JWKS_URI below).
     extra_hosts: ['host.docker.internal:host-gateway']
     environment:
       DB_HOST: host.docker.internal
       DB_PORT: '5432'
       POSTGRES_DB: planelyx_ocr
       POSTGRES_USER: planelyx_ocr
-      # Guarded rather than bare because the service's config schema rejects an empty password
-      # at startup, which would leave the container restart-looping on a validation error whose
-      # cause is a missing key in this file.
       POSTGRES_PASSWORD: ${OCR_DB_PASSWORD:?OCR_DB_PASSWORD is not set}
-      # The service defaults to 127.0.0.1, which is right for a bare-metal run and unreachable
-      # here: inside the container that is the container's own loopback, so the published port
-      # would connect to nothing. Exposure is still limited — the publish above is loopback-only.
       HTTP_HOST: 0.0.0.0
-      # Compared against the token's `iss` claim byte for byte, so it is the public URL.
       KEYCLOAK_ISSUER_URI: https://planelyx.com/auth/realms/planelyx
-      # Where the keys are actually fetched from, which is deliberately *not* the issuer. Nothing
-      # is matched against this string, so it goes over the Compose network and skips the nginx
-      # hairpin `api` needs. The /auth prefix is KC_HTTP_RELATIVE_PATH, baked into the auth image.
       KEYCLOAK_JWKS_URI: http://auth:8080/auth/realms/planelyx/protocol/openid-connect/certs
-      # Confirmed transactions are written here, forwarding the caller's own bearer token — there
-      # is no client credential to configure. Internal for the same reason as the JWKS URL.
       PLANELYX_API_URL: http://api:8080/api
-      # nginx serves the UI and this service under one host, so no browser request to it is
-      # cross-origin. Left unset, which denies every cross-origin request outright.
-      #
-      # Originals are encrypted at rest under a key the service generates on first boot. Both
-      # paths are volumes below, and the key is deliberately not inside the data directory.
       OCR_DATA_DIR: /app/data
       OCR_MASTER_KEY_FILE: /app/keys/master.key
-      # Explicit rather than left to the default. This flag is the whole of what keeps financial
-      # documents from being sent to a third party, and a value that has to be read out of the
-      # image's defaults is one nobody can audit from this file.
       OCR_LLM_ENABLED: 'false'
-    # Healthcheck is defined in the image itself (wget /ocr/healthz), and it queries the
-    # database rather than only the event loop — so `--wait` cannot roll forward onto a
-    # container that is up but cannot serve a request.
-    #
-    # No depends_on: JWKS and the ledger are both fetched lazily on the first request that needs
-    # them, so this service starts perfectly well before `auth` and `api` are ready.
     volumes:
       - ocr-data:/app/data
       - ocr-keys:/app/keys
     logging: *logging
 
-# ⚠️ `ocr-keys` is the one volume here whose loss is unrecoverable. Every document under
-# `ocr-data` is encrypted with the key inside it, so a backup of the data alone restores
-# nothing — they are separate volumes precisely so that a snapshot of one cannot be mistaken
-# for a backup. See VPS_SETUP.md §15.
 volumes:
   ocr-data:
   ocr-keys:
