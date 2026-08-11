@@ -1,34 +1,5 @@
 name: deploy
 
-# Deploys any subset of the four services to the VPS over SSH.
-#
-# A service is touched only if you give it a tag. Everything else keeps the tag it is
-# already running: the workflow reads the current tags off the VPS and carries them forward,
-# so unselected services end up with a byte-identical `image:` line and Compose leaves their
-# containers alone.
-#
-# The VPS holds no git checkout of this repo. `compose.prod.yaml` is shipped from the commit
-# being deployed, so the running topology can never drift from what is on master — and there
-# is no `git pull` to forget. nginx is the exception: its configs live in /etc/nginx, are
-# root-owned, and are still installed by hand (see VPS_SETUP.md).
-#
-# `.env` on the VPS is rendered from the secrets below on every run. That makes GitHub the
-# source of truth for those credentials — a value hand-edited on the box is reverted by the
-# next deploy. The drift check exists so that reversion can never happen silently.
-#
-# ⚠️ THE FIRST RUN AFTER `ocr` WAS ADDED IS A ONE-OFF. A VPS whose `.env` predates it has
-# neither `OCR_TAG` nor `OCR_DB_PASSWORD`, so both of this workflow's safety nets fire on
-# values that are simply not there yet:
-#
-#   - `OCR_TAG` cannot be carried forward from a file that does not contain it, so that run
-#     must supply an ocr tag rather than leaving the box blank.
-#   - `OCR_DB_PASSWORD` reads back empty and registers as drift, so that run must also tick
-#     "Allow DB/Keycloak credentials to differ".
-#
-# Both are the checks working correctly on a genuinely new key, not something to route around.
-# Create the `planelyx_ocr` role first (VPS_SETUP.md §7) — the password in the repo secret has
-# to be one Postgres already accepts. Every run after that is ordinary.
-
 on:
   workflow_dispatch:
     inputs:
@@ -56,45 +27,26 @@ on:
 permissions:
   contents: read
 
-# Two deploys interleaving would race on a single `.env`. Never cancel one in flight: the
-# dangerous moment is between `mv .env.staged .env` and the end of `up -d`.
 concurrency:
   group: deploy-production
   cancel-in-progress: false
 
 env:
-  # Mirrors the four service repos' release.yml, which push to this same path.
   REGION: southamerica-east1
   REPOSITORY: planelyx
   VPS_PATH: planelyx-infra
   PUBLIC_URL: https://planelyx.com
-  # `--wait-timeout` is mandatory, because without it `--wait` waits forever. 300s is a floor,
-  # not a guess: auth's healthcheck is start_period 45s + 20 retries x 10s, and api runs Flyway
-  # before it reports healthy.
   WAIT_TIMEOUT: '300'
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: production
-    # A hung SSH would otherwise sit on the 6-hour default.
     timeout-minutes: 15
 
     steps:
-      # compose.prod.yaml is shipped to the VPS from this checkout, which is what removes the
-      # need for a clone on the box.
       - uses: actions/checkout@v5
 
-      # ---------------------------------------------------------------- validate ----
-      # Everything that can be judged without touching the VPS is judged here, so a
-      # malformed request never reaches production.
-      #
-      # The tag *is* the selection — there is no separate per-service checkbox, because
-      # workflow_dispatch renders a static form and cannot show or require one input based on
-      # another. A checkbox would therefore be a second field free to contradict the tag box
-      # next to it; one field per service cannot disagree with itself. All of this goes through
-      # `env:` rather than `${{ }}` inside the script: these inputs are free text from whoever
-      # pressed the button, and `${{ }}` substitutes *before* bash parses the line.
       - name: Validate inputs
         id: validate
         env:
@@ -110,6 +62,8 @@ jobs:
           KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
           PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OCR_LLM_ENABLED: ${{ vars.OCR_LLM_ENABLED }}
         run: |
           set -euo pipefail
           fail=0
@@ -120,7 +74,6 @@ jobs:
               tag_var="${upper}_TAG"
               tag=${!tag_var}
 
-              # Blank means "leave this service alone", which is the whole selection mechanism.
               [[ -n $tag ]] || continue
 
               if [[ ! $tag =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
@@ -136,11 +89,6 @@ jobs:
               fail=1
           fi
 
-          # Compose's dotenv parser is not a shell: inside single quotes it has no escape
-          # sequence at all, so a value containing ' simply cannot be represented. Values are
-          # rendered single-quoted because that is the only form Compose leaves un-interpolated
-          # (see the $-truncation warning in .env.example), so this is a hard constraint rather
-          # than a style rule. `openssl rand -base64 32` never emits ' or $.
           for name in GCP_PROJECT_ID APP_DB_PASSWORD KC_DB_PASSWORD OCR_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET; do
               value=${!name}
               if [[ -z $value ]]; then
@@ -152,15 +100,21 @@ jobs:
               fi
           done
 
+          if [[ -n ${ANTHROPIC_API_KEY:-} && ${ANTHROPIC_API_KEY:-} == *"'"* ]]; then
+              echo "::error::Repo secret ANTHROPIC_API_KEY contains a single quote, which cannot be represented in a Compose .env value."
+              fail=1
+          fi
+
+          if [[ ${OCR_LLM_ENABLED:-false} == true && -z ${ANTHROPIC_API_KEY:-} ]]; then
+              echo "::error::Repo variable OCR_LLM_ENABLED is true but the ANTHROPIC_API_KEY secret is empty. The ocr service refuses to start in that state (src/config.ts), so it would restart-loop on the VPS. Set the key, or set OCR_LLM_ENABLED to false to keep every document on the machine."
+              fail=1
+          fi
+
           (( fail == 0 )) || exit 1
 
           echo "services=${services[*]}" >> "$GITHUB_OUTPUT"
           echo "Selected: ${services[*]}"
 
-      # -------------------------------------------------------------------- ssh ----
-      # Plain openssh rather than a marketplace action: nothing third-party then handles the
-      # deploy key. StrictHostKeyChecking is only meaningful because known_hosts is pinned
-      # from a secret.
       - name: Configure SSH
         env:
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
@@ -172,8 +126,6 @@ jobs:
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           umask 077
-          # The trailing newline is required — openssh rejects a key file without one as
-          # "invalid format", which reads like a corrupt key rather than a missing byte.
           printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
           printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" > ~/.ssh/deploy_known_hosts
 
@@ -182,14 +134,6 @@ jobs:
               echo "REMOTE=$VPS_USER@$VPS_HOST"
           } >> "$GITHUB_ENV"
 
-      # ------------------------------------------------------------------- ship ----
-      # Staged rather than installed, for the same reason as `.env` below: until the pull has
-      # proved the tags exist, nothing on the VPS has changed. Shipping the compose file
-      # straight from this commit is what removes the stale-checkout failure mode, where a
-      # deploy silently ran against an older topology.
-      #
-      # Also the first SSH of the run, so a broken key or host pin fails here rather than
-      # halfway through.
       - name: Ship compose.prod.yaml
         run: |
           set -euo pipefail
@@ -197,9 +141,6 @@ jobs:
           ssh $SSH_OPTS "$REMOTE" "cat > '$VPS_PATH/compose.prod.yaml.staged'" < compose.prod.yaml
           echo "Shipped compose.prod.yaml from ${GITHUB_SHA:0:7}"
 
-      # ------------------------------------------------------------ current state ----
-      # "If the SHA is null, don't touch that container" lives here: a service that was not
-      # selected keeps whatever tag the VPS is already running.
       - name: Read current tags from the VPS
         id: current
         env:
@@ -211,15 +152,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Read one key out of the VPS `.env`, the way Compose would. `bash -s` rather than a
-          # remote command string: the parser below is dense with quotes, and re-quoting it for
-          # the remote shell is how it would acquire a bug nobody can see.
-          #
-          # `tail -n1` is last-key-wins, matching Compose (and never `head`, which SIGPIPEs the
-          # producer and trips pipefail). `tr -d '\r'` is not defensive padding: a CRLF .env
-          # yields a tag ending in \r, and the only symptom is `manifest unknown` for a SHA you
-          # can see in the registry. Only a *matched* surrounding pair of quotes is stripped.
-          # Prints nothing if the key is absent.
           read_env_key() {
               ssh $SSH_OPTS "$REMOTE" "bash -s -- '$VPS_PATH' '$1'" <<'REMOTE_SCRIPT'
           set -euo pipefail
@@ -250,9 +182,6 @@ jobs:
                   continue
               else
                   resolved=$(read_env_key "${upper}_TAG")
-                  # Compose only *warns* on an unresolved variable, so a blank carry-forward
-                  # would render `image: registry/ui:` and fail much later with an opaque
-                  # "invalid reference format". Catch it here, where the cause is obvious.
                   if [[ ! $resolved =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
                       echo "::error::Cannot carry forward ${upper}_TAG: the value in the VPS .env is missing or malformed. Fix it on the box, or supply a tag for '$svc' explicitly."
                       fail=1
@@ -268,10 +197,6 @@ jobs:
 
           echo "carried=${carried[*]}" >> "$GITHUB_OUTPUT"
 
-      # The failure this prevents is a deferred one. If a credential in GitHub does not match
-      # the live Postgres role, deploying only `ui` rewrites .env harmlessly — and then a
-      # routine `api` deploy weeks later recreates the container with the wrong password,
-      # producing an outage that looks unrelated to the change that caused it.
       - name: Check for credential drift
         if: ${{ steps.current.outputs.env_exists == 'yes' && !inputs.allow_secret_change }}
         env:
@@ -282,12 +207,10 @@ jobs:
           KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
           PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
 
-          # Same parser as the step above. Duplicated rather than shared because each step is
-          # its own process — and a helper file would have to live on the VPS, which is the
-          # dependency this workflow exists to remove.
           read_env_key() {
               ssh $SSH_OPTS "$REMOTE" "bash -s -- '$VPS_PATH' '$1'" <<'REMOTE_SCRIPT'
           set -euo pipefail
@@ -302,7 +225,7 @@ jobs:
 
           fail=0
 
-          for name in APP_DB_PASSWORD KC_DB_PASSWORD OCR_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET; do
+          for name in APP_DB_PASSWORD KC_DB_PASSWORD OCR_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET ANTHROPIC_API_KEY; do
               on_vps=$(read_env_key "$name")
               if [[ $on_vps != "${!name}" ]]; then
                   echo "::error::Secret drift: $name differs between the repo secret and the VPS .env. If this is a deliberate rotation, re-run with 'Allow DB/Keycloak credentials to differ' ticked — and make sure the Postgres role was changed to match."
@@ -311,12 +234,8 @@ jobs:
           done
 
           (( fail == 0 )) || exit 1
-          echo "No drift: the seven credentials match what the VPS is already using."
+          echo "No drift: the eight credentials match what the VPS is already using."
 
-      # ------------------------------------------------------------------ deploy ----
-      # Staged, not installed. The pull below is what proves the tags exist in Artifact
-      # Registry, and until it succeeds `.env` is untouched and no container has been
-      # recreated — so a mistyped SHA costs a red run and nothing else.
       - name: Stage the rendered .env
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -327,6 +246,10 @@ jobs:
           KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
           PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OCR_LLM_ENABLED: ${{ vars.OCR_LLM_ENABLED }}
+          OCR_LLM_PARSE_MODE: ${{ vars.OCR_LLM_PARSE_MODE }}
+          OCR_LLM_MONTHLY_CEILING_USD: ${{ vars.OCR_LLM_MONTHLY_CEILING_USD }}
           API_TAG: ${{ steps.current.outputs.api_tag }}
           UI_TAG: ${{ steps.current.outputs.ui_tag }}
           AUTH_TAG: ${{ steps.current.outputs.auth_tag }}
@@ -335,10 +258,6 @@ jobs:
           set -euo pipefail
           umask 077
 
-          # Tags are bare — they are already constrained to [A-Za-z0-9._-]. Credentials are
-          # single-quoted, the one form Compose does not interpolate: unquoted, a password
-          # containing $ is silently truncated and surfaces much later as a database
-          # connection timeout. See the warning block at the top of .env.example.
           rendered=$(
               printf '# Rendered by .github/workflows/deploy.yml (run %s). Hand edits are lost on the next deploy.\n' "$GITHUB_RUN_ID"
               printf 'REGISTRY=%s-docker.pkg.dev/%s/%s\n' "$REGION" "$GCP_PROJECT_ID" "$REPOSITORY"
@@ -353,11 +272,12 @@ jobs:
               printf "KC_ADMIN_PASSWORD='%s'\n" "$KC_ADMIN_PASSWORD"
               printf "KEYCLOAK_ADMIN_CLIENT_SECRET='%s'\n" "$KEYCLOAK_ADMIN_CLIENT_SECRET"
               printf "PLANELYX_PROVISIONING_SECRET='%s'\n" "$PLANELYX_PROVISIONING_SECRET"
+              printf 'OCR_LLM_ENABLED=%s\n' "${OCR_LLM_ENABLED:-false}"
+              printf 'OCR_LLM_PARSE_MODE=%s\n' "${OCR_LLM_PARSE_MODE:-fallback}"
+              printf 'OCR_LLM_MONTHLY_CEILING_USD=%s\n' "${OCR_LLM_MONTHLY_CEILING_USD:-10}"
+              printf "ANTHROPIC_API_KEY='%s'\n" "${ANTHROPIC_API_KEY:-}"
           )
 
-          # Piped rather than scp'd: scp without -p lands the file at the remote umask (0644)
-          # and only then gets chmod'ed, leaving production credentials briefly world-readable.
-          # A pipe also keeps them out of argv, and therefore out of `ps` on the VPS.
           printf '%s\n' "$rendered" \
               | ssh $SSH_OPTS "$REMOTE" "umask 077 && cat > '$VPS_PATH/.env.staged'"
 
@@ -368,32 +288,15 @@ jobs:
           SELECTED: ${{ steps.validate.outputs.services }}
         run: |
           set -euo pipefail
-          # Both staged: this is the last step that can fail without having changed anything the
-          # running stack reads. --env-file suppresses the default .env, which is why the staged
-          # file has to carry all twelve keys rather than a delta. The project name comes from
-          # `name: planelyx` inside the compose file, so the staged file and the installed one
-          # address the same project.
           ssh $SSH_OPTS "$REMOTE" \
               "cd '$VPS_PATH' && docker compose -f compose.prod.yaml.staged --env-file .env.staged pull $SELECTED"
 
-      # Everything the old deploy.sh did, inlined. It no longer has to exist on the VPS, and
-      # therefore can no longer be out of date there.
       - name: Deploy
         env:
           SELECTED: ${{ steps.validate.outputs.services }}
         run: |
           set -euo pipefail
 
-          # The remote script's exit status is not, on its own, evidence that it ran. This script
-          # reaches the VPS through stdin, and a command inside it that reads stdin swallows
-          # whatever has not been parsed yet — see the `< /dev/null` note on the migration below.
-          # bash then reaches EOF and exits *0*, having silently skipped everything past the cut.
-          # `up` lives in that tail, so the deploy reports success against a stack it never
-          # touched, and the first sign of trouble is a container that does not exist.
-          #
-          # The sentinel closes that hole: it is the last line of the remote script, so it can
-          # only reach this log if the script survived transit whole. `tee` rather than a captured
-          # variable so the output still streams live — a deploy that hangs is worth watching.
           log="${RUNNER_TEMP:-/tmp}/deploy-remote.log"
 
           ssh $SSH_OPTS "$REMOTE" bash -s -- "$VPS_PATH" "$WAIT_TIMEOUT" $SELECTED <<'REMOTE_SCRIPT' | tee "$log"
@@ -404,17 +307,11 @@ jobs:
           services=("$@")
           COMPOSE=compose.prod.yaml
 
-          # The validate step already rejects an empty selection. Asserted again here because
-          # the consequence would be silent: `up --no-deps` with no service names means *every*
-          # service with its dependency edges dropped, which is the one command in this script
-          # that could take the stack down while reporting success.
           if (( ${#services[@]} == 0 )); then
               echo "error: no services passed to the deploy script" >&2
               exit 2
           fi
 
-          # .env.prev is the only record of the previously-deployed tags, since they are
-          # deliberately not committed. It is what a rollback reads.
           cp .env .env.prev 2>/dev/null || true
           mv .env.staged .env
           mv compose.prod.yaml.staged "$COMPOSE"
@@ -425,44 +322,12 @@ jobs:
               docker compose -f "$COMPOSE" logs --tail 50 "${services[@]}" >&2 || true
           }
 
-          # planelyx-ocr migrates its own database, and — unlike api, which runs Flyway on the way
-          # to reporting healthy — it does not do so at startup. Something has to, or the new
-          # container serves against the previous schema and fails on whichever query touches a
-          # column that does not exist yet. So it runs here, from the image being deployed, before
-          # `up` replaces anything.
-          #
-          # `run --rm` and not `exec`: the container it would exec into is the *old* one, which
-          # carries the old migrations. `-T` because there is no TTY at the far end of this SSH.
-          # Service ports are not published for a `run` container, so this cannot collide with the
-          # instance still serving on 8084.
-          #
-          # The script takes its own pre-migration dump into the data volume first and aborts if
-          # it cannot (planelyx-ocr/src/storage/migrate.ts) — that is deliberate and must not be
-          # traded for a `--skip-backup` here: staged extractions lost to a bad migration can only
-          # be regenerated by reprocessing every original.
           if [[ " ${services[*]} " == *" ocr "* ]]; then
               echo "Applying planelyx-ocr migrations..."
-              # `< /dev/null` is load-bearing, not tidiness. This entire script reaches the VPS
-              # through `bash -s`'s *stdin*, and `docker compose run` attaches stdin by default —
-              # `-T` only disables the pseudo-TTY, it does not detach it. Without the redirect the
-              # migration container consumes the rest of this heredoc: the `up` below never runs,
-              # bash reaches EOF and exits 0, and the deploy reports success having created
-              # nothing at all. That failure is silent and total, and it is indistinguishable from
-              # a healthy deploy until something notices the container was never made. Any
-              # `docker compose run` added to this script needs the same redirect.
               docker compose -f "$COMPOSE" run --rm -T ocr node dist/storage/migrate.js < /dev/null \
                   || { echo "error: planelyx-ocr migrations failed; the stack was not touched" >&2; exit 1; }
           fi
 
-          # `--wait` blocks until every service it touched is running|healthy and exits non-zero
-          # otherwise.
-          #
-          # Deploying all four takes the whole-stack path deliberately. `--no-deps` drops
-          # dependency edges outright — not just to services outside the selection — so
-          # `up --no-deps ui api auth ocr` would start api without waiting for auth to be healthy,
-          # and api resolves the OIDC metadata at startup. `--remove-orphans` also belongs only
-          # here: it is a whole-stack statement, and scoping it to a subset risks classifying
-          # the untouched services as orphans.
           if (( ${#services[@]} == 4 )); then
               docker compose -f "$COMPOSE" up -d --wait --wait-timeout "$wait_timeout" --remove-orphans \
                   || { dump_logs; exit 1; }
@@ -471,19 +336,11 @@ jobs:
                   || { dump_logs; exit 1; }
           fi
 
-          # Dangling images only — the previous release keeps its SHA tag, so a rollback still
-          # finds it locally. Never add `-a`: that removes every image without a running
-          # container, which is precisely the set you would roll back to. `|| true` because a
-          # transient daemon error here must not fail a deploy that has already passed its
-          # health gate.
           docker image prune -f || true
 
           echo
           docker compose -f "$COMPOSE" ps
 
-          # Must stay the last line of this script. The step below greps for it to prove the
-          # script was not truncated in transit, and anything printed after it would sit outside
-          # that guarantee.
           echo DEPLOY_SCRIPT_COMPLETE
           REMOTE_SCRIPT
 
@@ -492,7 +349,6 @@ jobs:
               exit 1
           }
 
-      # ------------------------------------------------------------------ verify ----
       - name: Smoke checks
         env:
           SELECTED: ${{ steps.validate.outputs.services }}
@@ -502,10 +358,6 @@ jobs:
           remote_compose="cd '$VPS_PATH' && docker compose -f compose.prod.yaml"
 
           if [[ " $SELECTED " == *" ui "* ]]; then
-              # `--wait` settles for "running" on a service with no healthcheck, and `ui`
-              # declares none — so a crash-looping nginx would pass the gate the instant it came
-              # up. Give it a dwell and check the restart counter, which is the only signal that
-              # distinguishes the two.
               cid=$(ssh $SSH_OPTS "$REMOTE" "$remote_compose ps -q ui | tail -n1") || cid=""
               if [[ -z $cid ]]; then
                   echo "::error::ui has no container after up."
@@ -533,9 +385,6 @@ jobs:
           fi
 
           if [[ " $SELECTED " == *" auth "* ]]; then
-              # The single most valuable assertion in this workflow. The API validates JWTs by
-              # issuer alone, so if this string drifts every authenticated request 401s — and
-              # that is exactly what a KC_HOSTNAME or KC_PROXY_HEADERS regression does.
               want="$PUBLIC_URL/auth/realms/planelyx"
               got=$(curl -fsS --retry 5 --retry-delay 3 \
                   "$PUBLIC_URL/auth/realms/planelyx/.well-known/openid-configuration" | jq -r '.issuer') || got=""
@@ -548,9 +397,6 @@ jobs:
           fi
 
           if [[ " $SELECTED " == *" api "* ]]; then
-              # nginx deliberately 404s /actuator, so the public side cannot see the health
-              # endpoint — a 404 there is indistinguishable from a healthy deploy. Check it
-              # from the VPS instead.
               health=$(ssh $SSH_OPTS "$REMOTE" \
                   "curl -fsS --retry 5 --retry-delay 3 http://127.0.0.1:8082/actuator/health") || health=""
               if [[ $health == *'"status":"UP"'* ]]; then
@@ -560,8 +406,6 @@ jobs:
                   fail=1
               fi
 
-              # And once publicly, to prove nginx -> container -> Spring Security is wired end
-              # to end. 401 is the pass condition here; 502 means the container is not there.
               code=$(curl -s -o /dev/null -w '%{http_code}' --retry 5 --retry-delay 3 \
                   "$PUBLIC_URL/api/bank-accounts") || code="000"
               if [[ $code == 401 ]]; then
@@ -573,10 +417,6 @@ jobs:
           fi
 
           if [[ " $SELECTED " == *" ocr "* ]]; then
-              # /ocr/healthz is open — Compose's `--wait` and the image's own HEALTHCHECK both
-              # call it without a token — but nginx does not expose it, so this runs on the box.
-              # It answers 503 rather than failing to respond when the database is unreachable,
-              # which is the failure a wrong OCR_DB_PASSWORD produces.
               health=$(ssh $SSH_OPTS "$REMOTE" \
                   "curl -fsS --retry 5 --retry-delay 3 http://127.0.0.1:8084/ocr/healthz") || health=""
               if [[ $health == *'"status":"ok"'* ]]; then
@@ -586,9 +426,6 @@ jobs:
                   fail=1
               fi
 
-              # Publicly, to prove nginx -> container -> token verification is wired end to end.
-              # 401 is the pass condition: 404 would mean the nginx location is missing, 502 that
-              # the container is not there.
               code=$(curl -s -o /dev/null -w '%{http_code}' --retry 5 --retry-delay 3 \
                   "$PUBLIC_URL/ocr/documents") || code="000"
               if [[ $code == 401 ]]; then
@@ -601,10 +438,6 @@ jobs:
 
           (( fail == 0 )) || exit 1
 
-      # Covers a failed `up` *and* a failed smoke check: a step with `if: failure()` runs when
-      # any earlier step failed. The remote script dumps its own logs when `up` is what broke,
-      # so this is the net for everything after that — a container that came up healthy and
-      # then fell over while the smoke checks were running.
       - name: Dump logs on failure
         if: ${{ failure() && steps.validate.outputs.services != '' }}
         env:
@@ -615,7 +448,6 @@ jobs:
                   "cd '$VPS_PATH' && docker compose -f compose.prod.yaml logs --tail 50 $SELECTED" || true
           fi
 
-      # Deployed tags are deliberately not committed, so this summary is the deploy history.
       - name: Summary
         if: ${{ always() && steps.validate.outputs.services != '' }}
         env:
@@ -648,13 +480,9 @@ jobs:
               echo "Rollback: re-run this workflow with the tags from the previous run, or read \`.env.prev\` on the VPS."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # `if: always()` cannot help when SSH itself is what failed. Both staged files are
-      # overwritten at the start of every run before anything reads them, so a leftover from a
-      # run that died mid-flight is inert rather than dangerous.
       - name: Clean up
         if: always()
         run: |
-          # The remote cleanup needs the key, so it has to run before the local one.
           if [[ -n ${REMOTE:-} ]]; then
               ssh $SSH_OPTS "$REMOTE" "rm -f '$VPS_PATH/.env.staged' '$VPS_PATH/compose.prod.yaml.staged'" || true
           fi

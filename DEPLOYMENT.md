@@ -30,6 +30,13 @@ carrying the realm export and login theme.
 > `VPS_SETUP.md`: it does **not** migrate its database at startup the way `api` runs Flyway —
 > the deploy does that explicitly — and it is the only container holding state of its own, in
 > volumes whose encryption key nothing can regenerate.
+>
+> It is also the only service that can send data off the box. Reading a statement the
+> coordinate parser cannot claim is delegated to Anthropic, gated behind `OCR_LLM_ENABLED`,
+> which defaults to `false` — the model is off until deliberately switched on, and the flag,
+> the parse mode and the monthly spend ceiling are repo *variables* so the setting is
+> auditable rather than buried in an image default. See "Repo variables" in
+> `VPS_SETUP.md` §13.
 
 ## What's built vs. what you run
 
