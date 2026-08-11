@@ -1170,6 +1170,27 @@ In `planelyx-infra` → Settings → Secrets and variables → Actions:
 | `KC_ADMIN_PASSWORD` | Keycloak bootstrap admin password |
 | `KEYCLOAK_ADMIN_CLIENT_SECRET` | secret of the `planelyx-api-admin` client — **read out of the Keycloak admin console**, not generated |
 | `PLANELYX_PROVISIONING_SECRET` | signs Keycloak's "a user registered" callback to the API; generate with `openssl rand -hex 32` |
+| `ANTHROPIC_API_KEY` | **optional** — model escalation for statements the coordinate parser cannot read. Leave unset to keep every document on the machine |
+
+### Repo variables (model escalation)
+
+Under the **Variables** tab beside the secrets, not Secrets — these are configuration, and a
+value nobody can read back is a value nobody can audit. All three may be left unset, which is
+the same as the defaults below and keeps the model switched off.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OCR_LLM_ENABLED` | `false` | Whether statement text may be sent to Anthropic at all |
+| `OCR_LLM_PARSE_MODE` | `fallback` | `fallback` escalates only a document the coordinate parser declined; `always` sends every document; `off` sends none |
+| `OCR_LLM_MONTHLY_CEILING_USD` | `10` | Hard monthly spend ceiling, enforced by the service against its own recorded spend before each call. `0` disables calls without unsetting the key |
+
+Setting `OCR_LLM_ENABLED=true` without `ANTHROPIC_API_KEY` is refused by the workflow before
+it deploys: the service exits on that combination rather than silently running without
+escalation, so the container would restart-loop on the box.
+
+The key is the one credential allowed to be empty. The service treats an empty value and an
+absent one as the same state — no key configured — so a stack that never sets it renders
+`ANTHROPIC_API_KEY=''` and starts perfectly well.
 
 > ⚠️ **Adding `OCR_DB_PASSWORD` to a stack that is already running is a one-off.** The `.env`
 > on the box predates the key, so the drift check reads it back empty and refuses — and
@@ -1178,7 +1199,7 @@ In `planelyx-infra` → Settings → Secrets and variables → Actions:
 > the `planelyx_ocr` role already created in [§7](#7-postgresql) using that exact password. Both
 > checks are behaving correctly here; every run afterwards is ordinary.
 
-The last seven must **byte-match what is in `.env` on the box right now**. The workflow
+The last eight must **byte-match what is in `.env` on the box right now**. The workflow
 compares them before it deploys and refuses to continue if they differ, precisely so a
 mismatch surfaces here rather than weeks later, when an unrelated deploy recreates a container
 with a password Postgres rejects.

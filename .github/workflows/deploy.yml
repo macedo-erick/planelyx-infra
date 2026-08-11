@@ -62,6 +62,8 @@ jobs:
           KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
           PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OCR_LLM_ENABLED: ${{ vars.OCR_LLM_ENABLED }}
         run: |
           set -euo pipefail
           fail=0
@@ -97,6 +99,16 @@ jobs:
                   fail=1
               fi
           done
+
+          if [[ -n ${ANTHROPIC_API_KEY:-} && ${ANTHROPIC_API_KEY:-} == *"'"* ]]; then
+              echo "::error::Repo secret ANTHROPIC_API_KEY contains a single quote, which cannot be represented in a Compose .env value."
+              fail=1
+          fi
+
+          if [[ ${OCR_LLM_ENABLED:-false} == true && -z ${ANTHROPIC_API_KEY:-} ]]; then
+              echo "::error::Repo variable OCR_LLM_ENABLED is true but the ANTHROPIC_API_KEY secret is empty. The ocr service refuses to start in that state (src/config.ts), so it would restart-loop on the VPS. Set the key, or set OCR_LLM_ENABLED to false to keep every document on the machine."
+              fail=1
+          fi
 
           (( fail == 0 )) || exit 1
 
@@ -195,6 +207,7 @@ jobs:
           KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
           PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
 
@@ -212,7 +225,7 @@ jobs:
 
           fail=0
 
-          for name in APP_DB_PASSWORD KC_DB_PASSWORD OCR_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET; do
+          for name in APP_DB_PASSWORD KC_DB_PASSWORD OCR_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET ANTHROPIC_API_KEY; do
               on_vps=$(read_env_key "$name")
               if [[ $on_vps != "${!name}" ]]; then
                   echo "::error::Secret drift: $name differs between the repo secret and the VPS .env. If this is a deliberate rotation, re-run with 'Allow DB/Keycloak credentials to differ' ticked — and make sure the Postgres role was changed to match."
@@ -221,7 +234,7 @@ jobs:
           done
 
           (( fail == 0 )) || exit 1
-          echo "No drift: the seven credentials match what the VPS is already using."
+          echo "No drift: the eight credentials match what the VPS is already using."
 
       - name: Stage the rendered .env
         env:
@@ -233,6 +246,10 @@ jobs:
           KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
           PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OCR_LLM_ENABLED: ${{ vars.OCR_LLM_ENABLED }}
+          OCR_LLM_PARSE_MODE: ${{ vars.OCR_LLM_PARSE_MODE }}
+          OCR_LLM_MONTHLY_CEILING_USD: ${{ vars.OCR_LLM_MONTHLY_CEILING_USD }}
           API_TAG: ${{ steps.current.outputs.api_tag }}
           UI_TAG: ${{ steps.current.outputs.ui_tag }}
           AUTH_TAG: ${{ steps.current.outputs.auth_tag }}
@@ -255,6 +272,10 @@ jobs:
               printf "KC_ADMIN_PASSWORD='%s'\n" "$KC_ADMIN_PASSWORD"
               printf "KEYCLOAK_ADMIN_CLIENT_SECRET='%s'\n" "$KEYCLOAK_ADMIN_CLIENT_SECRET"
               printf "PLANELYX_PROVISIONING_SECRET='%s'\n" "$PLANELYX_PROVISIONING_SECRET"
+              printf 'OCR_LLM_ENABLED=%s\n' "${OCR_LLM_ENABLED:-false}"
+              printf 'OCR_LLM_PARSE_MODE=%s\n' "${OCR_LLM_PARSE_MODE:-fallback}"
+              printf 'OCR_LLM_MONTHLY_CEILING_USD=%s\n' "${OCR_LLM_MONTHLY_CEILING_USD:-10}"
+              printf "ANTHROPIC_API_KEY='%s'\n" "${ANTHROPIC_API_KEY:-}"
           )
 
           printf '%s\n' "$rendered" \

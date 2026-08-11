@@ -95,7 +95,10 @@ services:
       PLANELYX_API_URL: http://api:8080/api
       OCR_DATA_DIR: /app/data
       OCR_MASTER_KEY_FILE: /app/keys/master.key
-      OCR_LLM_ENABLED: 'false'
+      OCR_LLM_ENABLED: ${OCR_LLM_ENABLED:-false}
+      OCR_LLM_PARSE_MODE: ${OCR_LLM_PARSE_MODE:-fallback}
+      OCR_LLM_MONTHLY_CEILING_USD: ${OCR_LLM_MONTHLY_CEILING_USD:-10}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     volumes:
       - ocr-data:/app/data
       - ocr-keys:/app/keys
