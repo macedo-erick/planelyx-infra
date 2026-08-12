@@ -1192,6 +1192,26 @@ The key is the one credential allowed to be empty. The service treats an empty v
 absent one as the same state — no key configured — so a stack that never sets it renders
 `ANTHROPIC_API_KEY=''` and starts perfectly well.
 
+### Repo variables (log levels)
+
+Also under **Variables**. All four may be left unset, which is the same as the defaults below.
+Raise one to diagnose something and put it back afterwards: Loki keeps 30 days, and a service
+left at `debug` will burn through that far sooner.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `API_LOG_LEVEL` | `INFO` | Spring, scoped to `com.planelyx.api` — the application's own logging |
+| `API_LOG_LEVEL_ROOT` | `INFO` | Spring, everything else: framework internals, Hibernate, Tomcat |
+| `OCR_LOG_LEVEL` | `info` | pino. **Lowercase only** — an uppercase value throws on startup and the container restart-loops |
+| `AUTH_LOG_LEVEL` | `info` | Keycloak's `KC_LOG_LEVEL`. A runtime option, so it needs no image rebuild |
+
+The API has two because raising the app to `DEBUG` is useful and raising Spring and Hibernate
+with it is not — that combination is what makes `DEBUG` unusable in production.
+
+The workflow rejects a value outside each service's own set before deploying, since nothing
+downstream would catch it: only `ui` has a restart-count smoke check, so a crash-looping `ocr`
+would otherwise pass the deploy and fail silently.
+
 > ⚠️ **Adding `OCR_DB_PASSWORD` to a stack that is already running is a one-off.** The `.env`
 > on the box predates the key, so the drift check reads it back empty and refuses — and
 > `OCR_TAG` cannot be carried forward from a file that has never contained it. That first run

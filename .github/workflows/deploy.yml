@@ -64,6 +64,10 @@ jobs:
           PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OCR_LLM_ENABLED: ${{ vars.OCR_LLM_ENABLED }}
+          API_LOG_LEVEL: ${{ vars.API_LOG_LEVEL }}
+          API_LOG_LEVEL_ROOT: ${{ vars.API_LOG_LEVEL_ROOT }}
+          OCR_LOG_LEVEL: ${{ vars.OCR_LOG_LEVEL }}
+          AUTH_LOG_LEVEL: ${{ vars.AUTH_LOG_LEVEL }}
         run: |
           set -euo pipefail
           fail=0
@@ -102,6 +106,28 @@ jobs:
 
           if [[ -n ${ANTHROPIC_API_KEY:-} && ${ANTHROPIC_API_KEY:-} == *"'"* ]]; then
               echo "::error::Repo secret ANTHROPIC_API_KEY contains a single quote, which cannot be represented in a Compose .env value."
+              fail=1
+          fi
+
+          # A bad level is not caught by anything downstream: pino throws on an unknown
+          # one and the container restart-loops, and only `ui` has a restart check.
+          for name in API_LOG_LEVEL API_LOG_LEVEL_ROOT; do
+              value=${!name}
+              [[ -z $value ]] && continue
+              if [[ ! ${value^^} =~ ^(TRACE|DEBUG|INFO|WARN|ERROR|FATAL|OFF)$ ]]; then
+                  echo "::error::Repo variable $name is '$value'. Expected one of TRACE DEBUG INFO WARN ERROR FATAL OFF."
+                  fail=1
+              fi
+          done
+
+          # Lowercase only — pino is case-sensitive and does not coerce.
+          if [[ -n ${OCR_LOG_LEVEL:-} && ! $OCR_LOG_LEVEL =~ ^(trace|debug|info|warn|error|fatal|silent)$ ]]; then
+              echo "::error::Repo variable OCR_LOG_LEVEL is '$OCR_LOG_LEVEL'. Expected one of trace debug info warn error fatal silent, lowercase."
+              fail=1
+          fi
+
+          if [[ -n ${AUTH_LOG_LEVEL:-} && ! ${AUTH_LOG_LEVEL^^} =~ ^(ALL|TRACE|DEBUG|INFO|WARN|ERROR|FATAL|OFF)$ ]]; then
+              echo "::error::Repo variable AUTH_LOG_LEVEL is '$AUTH_LOG_LEVEL'. Expected one of all trace debug info warn error fatal off."
               fail=1
           fi
 
@@ -250,6 +276,10 @@ jobs:
           OCR_LLM_ENABLED: ${{ vars.OCR_LLM_ENABLED }}
           OCR_LLM_PARSE_MODE: ${{ vars.OCR_LLM_PARSE_MODE }}
           OCR_LLM_MONTHLY_CEILING_USD: ${{ vars.OCR_LLM_MONTHLY_CEILING_USD }}
+          API_LOG_LEVEL: ${{ vars.API_LOG_LEVEL }}
+          API_LOG_LEVEL_ROOT: ${{ vars.API_LOG_LEVEL_ROOT }}
+          OCR_LOG_LEVEL: ${{ vars.OCR_LOG_LEVEL }}
+          AUTH_LOG_LEVEL: ${{ vars.AUTH_LOG_LEVEL }}
           API_TAG: ${{ steps.current.outputs.api_tag }}
           UI_TAG: ${{ steps.current.outputs.ui_tag }}
           AUTH_TAG: ${{ steps.current.outputs.auth_tag }}
@@ -276,6 +306,10 @@ jobs:
               printf 'OCR_LLM_PARSE_MODE=%s\n' "${OCR_LLM_PARSE_MODE:-fallback}"
               printf 'OCR_LLM_MONTHLY_CEILING_USD=%s\n' "${OCR_LLM_MONTHLY_CEILING_USD:-10}"
               printf "ANTHROPIC_API_KEY='%s'\n" "${ANTHROPIC_API_KEY:-}"
+              printf 'API_LOG_LEVEL=%s\n' "${API_LOG_LEVEL:-INFO}"
+              printf 'API_LOG_LEVEL_ROOT=%s\n' "${API_LOG_LEVEL_ROOT:-INFO}"
+              printf 'OCR_LOG_LEVEL=%s\n' "${OCR_LOG_LEVEL:-info}"
+              printf 'AUTH_LOG_LEVEL=%s\n' "${AUTH_LOG_LEVEL:-info}"
           )
 
           printf '%s\n' "$rendered" \

@@ -39,6 +39,11 @@ services:
       KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:?KEYCLOAK_ADMIN_CLIENT_SECRET is not set}
       PLANELYX_PROVISIONING_SECRET: ${PLANELYX_PROVISIONING_SECRET:?PLANELYX_PROVISIONING_SECRET is not set}
       PLANELYX_CORS_ORIGINS: https://planelyx.com
+      # Two knobs, because raising the app to DEBUG is useful and raising Spring and
+      # Hibernate with it is not — that combination is what makes DEBUG unusable in
+      # production. LOG_LEVEL is scoped to com.planelyx.api.
+      LOG_LEVEL: ${API_LOG_LEVEL:-INFO}
+      LOG_LEVEL_ROOT: ${API_LOG_LEVEL_ROOT:-INFO}
     depends_on:
       auth:
         condition: service_healthy
@@ -60,6 +65,9 @@ services:
       KC_PROXY_HEADERS: xforwarded
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_ADMIN}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
+      # A runtime option, so unlike KC_METRICS_ENABLED it is safe to set here without
+      # rebuilding the optimized image.
+      KC_LOG_LEVEL: ${AUTH_LOG_LEVEL:-info}
       PLANELYX_UI_ORIGIN: https://planelyx.com
       PLANELYX_UI_BASE_URL: https://planelyx.com/ui
       PLANELYX_KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:?KEYCLOAK_ADMIN_CLIENT_SECRET is not set}
@@ -95,6 +103,9 @@ services:
       PLANELYX_API_URL: http://api:8080/api
       OCR_DATA_DIR: /app/data
       OCR_MASTER_KEY_FILE: /app/keys/master.key
+      # pino, so lowercase only: an uppercase value throws on startup rather than
+      # being coerced, and the container restart-loops.
+      LOG_LEVEL: ${OCR_LOG_LEVEL:-info}
       OCR_LLM_ENABLED: ${OCR_LLM_ENABLED:-false}
       OCR_LLM_PARSE_MODE: ${OCR_LLM_PARSE_MODE:-fallback}
       OCR_LLM_MONTHLY_CEILING_USD: ${OCR_LLM_MONTHLY_CEILING_USD:-10}
