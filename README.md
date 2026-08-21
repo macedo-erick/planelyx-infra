@@ -4,7 +4,8 @@ Planelyx is a personal-finance application. It is split across four repositories
 Boot API, an Angular SPA, a statement ingestion service, and this one, which is the deployment
 layer. Everything of Planelyx's that lives on the VPS is here: the production Compose stack and
 the host nginx config. It builds nothing, and the VPS holds no checkout of it — the deploy
-workflow ships `compose.prod.yaml` to the box from the commit being deployed.
+workflow ships `compose.prod.yaml` and the nginx config to the box from the commit being
+deployed.
 
 The whole system runs on a single VPS. GitHub Actions builds each service and pushes it to
 GCP Artifact Registry; the VPS pulls those images into a Compose stack that sits behind a
@@ -40,10 +41,10 @@ real time, not just the happy path.
 
 ```
 compose.prod.yaml            ui / api / ocr, all bound to 127.0.0.1; shipped to the VPS per deploy
-.github/workflows/deploy.yml the whole deploy: ships compose, renders .env, pulls, up -d, verifies
+.github/workflows/deploy.yml the whole deploy: ships compose + nginx, renders .env, pulls, up -d, verifies
 .env.example                 reference only — the workflow renders the real .env on every run
-nginx/planelyx.conf          -> /etc/nginx/sites-available/planelyx
-nginx/snippets/planelyx-proxy.conf -> /etc/nginx/snippets/
+nginx/planelyx.conf          -> /etc/nginx/sites-available/planelyx        (installed per deploy)
+nginx/snippets/planelyx-proxy.conf -> /etc/nginx/snippets/                 (installed per deploy)
 ```
 
 ## Topology
@@ -86,6 +87,13 @@ button, because a push to its `master` builds and deploys itself.
 
 Rollback is the same workflow with the previous SHA. The previous tags are in the prior run's
 job summary, and in `.env.prev` on the VPS.
+
+The nginx config ships on every run too, so a routing change is released by merging it and
+pressing the same button. The step reloads nginx only when a file actually changed, validates
+with `nginx -t` before reloading, and restores the previous files and fails the run if that
+test does not pass — this nginx also fronts the monitoring stack, so a broken config must not
+reach it. The previous files are kept in `~/planelyx-infra/nginx-prev/` on the VPS. It needs
+the one-time bootstrap in `VPS_SETUP.md` §9 (file ownership plus a two-command sudoers rule).
 
 The workflow renders `.env` from this repo's secrets on every run, so **GitHub is the source
 of truth for the DB credentials** — a value hand-edited on the box is reverted on

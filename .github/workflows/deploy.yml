@@ -32,7 +32,11 @@ env:
   REPOSITORY: planelyx
   VPS_PATH: planelyx-infra
   PUBLIC_URL: https://planelyx.com
+  NEIGHBOUR_URL: https://monitoring.macedosoftware.com/login
   WAIT_TIMEOUT: '300'
+  # Installed by this repo. snippets/keycloak-proxy.conf is deliberately absent: the auth
+  # repo owns that file, and planelyx.conf includes it. Never delete what is not listed here.
+  NGINX_PAYLOAD: nginx/planelyx.conf nginx/snippets/planelyx-proxy.conf
 
 jobs:
   deploy:
@@ -146,12 +150,16 @@ jobs:
               echo "REMOTE=$VPS_USER@$VPS_HOST"
           } >> "$GITHUB_ENV"
 
-      - name: Ship compose.prod.yaml
+      - name: Ship compose.prod.yaml and the nginx config
         run: |
           set -euo pipefail
           ssh $SSH_OPTS "$REMOTE" "mkdir -p '$VPS_PATH'"
           ssh $SSH_OPTS "$REMOTE" "cat > '$VPS_PATH/compose.prod.yaml.staged'" < compose.prod.yaml
-          echo "Shipped compose.prod.yaml from ${GITHUB_SHA:0:7}"
+
+          ssh $SSH_OPTS "$REMOTE" "rm -rf '$VPS_PATH/.nginx-staged' && mkdir -p '$VPS_PATH/.nginx-staged'"
+          tar -cz $NGINX_PAYLOAD | ssh $SSH_OPTS "$REMOTE" "tar -xz -C '$VPS_PATH/.nginx-staged'"
+
+          echo "Shipped compose.prod.yaml and the nginx config from ${GITHUB_SHA:0:7}"
 
       - name: Read current tags from the VPS
         id: current
@@ -355,6 +363,75 @@ jobs:
               exit 1
           }
 
+      - name: Install the nginx config
+        run: |
+          set -euo pipefail
+
+          ssh $SSH_OPTS "$REMOTE" bash -s -- "$VPS_PATH" $NGINX_PAYLOAD <<'REMOTE_SCRIPT'
+          set -euo pipefail
+          cd "$1"
+          shift
+          payload=("$@")
+
+          # Repo path -> live path. The vhost has no .conf suffix on the box; the snippet does.
+          live_path_for() {
+              case "$1" in
+                  nginx/planelyx.conf)                 echo /etc/nginx/sites-available/planelyx ;;
+                  nginx/snippets/planelyx-proxy.conf)  echo /etc/nginx/snippets/planelyx-proxy.conf ;;
+                  *) echo "error: no live path mapped for '$1'" >&2; return 1 ;;
+              esac
+          }
+
+          mkdir -p nginx-prev
+          changed=()
+
+          for item in "${payload[@]}"; do
+              new=".nginx-staged/$item"
+              live=$(live_path_for "$item")
+
+              if [[ ! -e $live ]]; then
+                  echo "error: $live does not exist. Run the bootstrap in VPS_SETUP.md §9 first." >&2
+                  exit 1
+              fi
+              if [[ ! -w $live ]]; then
+                  echo "error: $live is not writable by this user. See VPS_SETUP.md §9." >&2
+                  exit 1
+              fi
+
+              cmp -s "$new" "$live" || changed+=("$item")
+          done
+
+          if (( ${#changed[@]} == 0 )); then
+              echo "nginx: config unchanged, not reloading"
+              exit 0
+          fi
+
+          printf 'nginx: changed -> %s\n' "${changed[@]}"
+
+          restore() {
+              for item in "${changed[@]}"; do
+                  cp "nginx-prev/$(basename "$item")" "$(live_path_for "$item")"
+              done
+          }
+
+          for item in "${changed[@]}"; do
+              live=$(live_path_for "$item")
+              cp "$live" "nginx-prev/$(basename "$item")"
+              cp ".nginx-staged/$item" "$live"
+          done
+
+          # Validate before reloading: this nginx also serves monitoring.macedosoftware.com,
+          # so a bad config here must never reach the running process.
+          if ! sudo nginx -t; then
+              restore
+              echo "error: nginx -t failed; previous config restored, nginx not reloaded" >&2
+              exit 1
+          fi
+
+          sudo systemctl reload nginx
+          echo "nginx: config updated and reloaded"
+          REMOTE_SCRIPT
+
       - name: Smoke checks
         env:
           SELECTED: ${{ steps.validate.outputs.services }}
@@ -430,6 +507,14 @@ jobs:
               fi
           fi
 
+          # The nginx reload touched a process shared with the monitoring stack.
+          if curl -fsS --retry 5 --retry-delay 3 -o /dev/null "$NEIGHBOUR_URL"; then
+              echo "neighbour: $NEIGHBOUR_URL still serves"
+          else
+              echo "::error::neighbour: $NEIGHBOUR_URL broke after the nginx reload."
+              fail=1
+          fi
+
           (( fail == 0 )) || exit 1
 
       - name: Dump logs on failure
@@ -477,6 +562,6 @@ jobs:
         if: always()
         run: |
           if [[ -n ${REMOTE:-} ]]; then
-              ssh $SSH_OPTS "$REMOTE" "rm -f '$VPS_PATH/.env.staged' '$VPS_PATH/compose.prod.yaml.staged'" || true
+              ssh $SSH_OPTS "$REMOTE" "rm -rf '$VPS_PATH/.env.staged' '$VPS_PATH/compose.prod.yaml.staged' '$VPS_PATH/.nginx-staged'" || true
           fi
           rm -f ~/.ssh/deploy_key ~/.ssh/deploy_known_hosts
