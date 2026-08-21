@@ -11,16 +11,12 @@ on:
         description: 'UI image tag (commit SHA) — leave blank to leave the UI untouched'
         type: string
         default: ''
-      auth_tag:
-        description: 'Keycloak image tag (commit SHA) — leave blank to leave Keycloak untouched'
-        type: string
-        default: ''
       ocr_tag:
         description: 'OCR image tag (commit SHA) — leave blank to leave the OCR service untouched'
         type: string
         default: ''
       allow_secret_change:
-        description: 'Allow DB/Keycloak credentials to differ from the VPS (credential rotation)'
+        description: 'Allow DB credentials to differ from the VPS (credential rotation)'
         type: boolean
         default: false
 
@@ -52,14 +48,10 @@ jobs:
         env:
           API_TAG: ${{ inputs.api_tag }}
           UI_TAG: ${{ inputs.ui_tag }}
-          AUTH_TAG: ${{ inputs.auth_tag }}
           OCR_TAG: ${{ inputs.ocr_tag }}
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           APP_DB_PASSWORD: ${{ secrets.APP_DB_PASSWORD }}
-          KC_DB_PASSWORD: ${{ secrets.KC_DB_PASSWORD }}
           OCR_DB_PASSWORD: ${{ secrets.OCR_DB_PASSWORD }}
-          KC_ADMIN: ${{ secrets.KC_ADMIN }}
-          KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
           PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -67,13 +59,12 @@ jobs:
           API_LOG_LEVEL: ${{ vars.API_LOG_LEVEL }}
           API_LOG_LEVEL_ROOT: ${{ vars.API_LOG_LEVEL_ROOT }}
           OCR_LOG_LEVEL: ${{ vars.OCR_LOG_LEVEL }}
-          AUTH_LOG_LEVEL: ${{ vars.AUTH_LOG_LEVEL }}
         run: |
           set -euo pipefail
           fail=0
           services=()
 
-          for svc in api ui auth ocr; do
+          for svc in api ui ocr; do
               upper=${svc^^}
               tag_var="${upper}_TAG"
               tag=${!tag_var}
@@ -89,11 +80,11 @@ jobs:
           done
 
           if (( fail == 0 )) && (( ${#services[@]} == 0 )); then
-              echo "::error::No service selected. Give the commit SHA of at least one service (the service repo's release run prints it as 'API_TAG=...', 'UI_TAG=...', 'AUTH_TAG=...' or 'OCR_TAG=...')."
+              echo "::error::No service selected. Give the commit SHA of at least one service (the service repo's release run prints it as 'API_TAG=...', 'UI_TAG=...' or 'OCR_TAG=...')."
               fail=1
           fi
 
-          for name in GCP_PROJECT_ID APP_DB_PASSWORD KC_DB_PASSWORD OCR_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET; do
+          for name in GCP_PROJECT_ID APP_DB_PASSWORD OCR_DB_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET; do
               value=${!name}
               if [[ -z $value ]]; then
                   echo "::error::Repo secret $name is empty or not set."
@@ -123,11 +114,6 @@ jobs:
           # Lowercase only — pino is case-sensitive and does not coerce.
           if [[ -n ${OCR_LOG_LEVEL:-} && ! $OCR_LOG_LEVEL =~ ^(trace|debug|info|warn|error|fatal|silent)$ ]]; then
               echo "::error::Repo variable OCR_LOG_LEVEL is '$OCR_LOG_LEVEL'. Expected one of trace debug info warn error fatal silent, lowercase."
-              fail=1
-          fi
-
-          if [[ -n ${AUTH_LOG_LEVEL:-} && ! ${AUTH_LOG_LEVEL^^} =~ ^(ALL|TRACE|DEBUG|INFO|WARN|ERROR|FATAL|OFF)$ ]]; then
-              echo "::error::Repo variable AUTH_LOG_LEVEL is '$AUTH_LOG_LEVEL'. Expected one of all trace debug info warn error fatal off."
               fail=1
           fi
 
@@ -173,7 +159,6 @@ jobs:
           SELECTED: ${{ steps.validate.outputs.services }}
           IN_API_TAG: ${{ inputs.api_tag }}
           IN_UI_TAG: ${{ inputs.ui_tag }}
-          IN_AUTH_TAG: ${{ inputs.auth_tag }}
           IN_OCR_TAG: ${{ inputs.ocr_tag }}
         run: |
           set -euo pipefail
@@ -196,14 +181,14 @@ jobs:
           fail=0
           carried=()
 
-          for svc in api ui auth ocr; do
+          for svc in api ui ocr; do
               upper=${svc^^}
               input_var="IN_${upper}_TAG"
 
               if [[ " $SELECTED " == *" $svc "* ]]; then
                   resolved=${!input_var}
               elif [[ $env_exists == no ]]; then
-                  echo "::error::First deploy: no .env exists on the VPS yet, so all four tags must be supplied. '$svc' was left blank."
+                  echo "::error::First deploy: no .env exists on the VPS yet, so all three tags must be supplied. '$svc' was left blank."
                   fail=1
                   continue
               else
@@ -227,10 +212,7 @@ jobs:
         if: ${{ steps.current.outputs.env_exists == 'yes' && !inputs.allow_secret_change }}
         env:
           APP_DB_PASSWORD: ${{ secrets.APP_DB_PASSWORD }}
-          KC_DB_PASSWORD: ${{ secrets.KC_DB_PASSWORD }}
           OCR_DB_PASSWORD: ${{ secrets.OCR_DB_PASSWORD }}
-          KC_ADMIN: ${{ secrets.KC_ADMIN }}
-          KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
           PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -251,25 +233,22 @@ jobs:
 
           fail=0
 
-          for name in APP_DB_PASSWORD KC_DB_PASSWORD OCR_DB_PASSWORD KC_ADMIN KC_ADMIN_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET ANTHROPIC_API_KEY; do
+          for name in APP_DB_PASSWORD OCR_DB_PASSWORD KEYCLOAK_ADMIN_CLIENT_SECRET PLANELYX_PROVISIONING_SECRET ANTHROPIC_API_KEY; do
               on_vps=$(read_env_key "$name")
               if [[ $on_vps != "${!name}" ]]; then
-                  echo "::error::Secret drift: $name differs between the repo secret and the VPS .env. If this is a deliberate rotation, re-run with 'Allow DB/Keycloak credentials to differ' ticked — and make sure the Postgres role was changed to match."
+                  echo "::error::Secret drift: $name differs between the repo secret and the VPS .env. If this is a deliberate rotation, re-run with 'Allow DB credentials to differ' ticked — and make sure the Postgres role, or the auth repo's copy of a shared secret, was changed to match."
                   fail=1
               fi
           done
 
           (( fail == 0 )) || exit 1
-          echo "No drift: the eight credentials match what the VPS is already using."
+          echo "No drift: the five credentials match what the VPS is already using."
 
       - name: Stage the rendered .env
         env:
           GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           APP_DB_PASSWORD: ${{ secrets.APP_DB_PASSWORD }}
-          KC_DB_PASSWORD: ${{ secrets.KC_DB_PASSWORD }}
           OCR_DB_PASSWORD: ${{ secrets.OCR_DB_PASSWORD }}
-          KC_ADMIN: ${{ secrets.KC_ADMIN }}
-          KC_ADMIN_PASSWORD: ${{ secrets.KC_ADMIN_PASSWORD }}
           KEYCLOAK_ADMIN_CLIENT_SECRET: ${{ secrets.KEYCLOAK_ADMIN_CLIENT_SECRET }}
           PLANELYX_PROVISIONING_SECRET: ${{ secrets.PLANELYX_PROVISIONING_SECRET }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -279,10 +258,8 @@ jobs:
           API_LOG_LEVEL: ${{ vars.API_LOG_LEVEL }}
           API_LOG_LEVEL_ROOT: ${{ vars.API_LOG_LEVEL_ROOT }}
           OCR_LOG_LEVEL: ${{ vars.OCR_LOG_LEVEL }}
-          AUTH_LOG_LEVEL: ${{ vars.AUTH_LOG_LEVEL }}
           API_TAG: ${{ steps.current.outputs.api_tag }}
           UI_TAG: ${{ steps.current.outputs.ui_tag }}
-          AUTH_TAG: ${{ steps.current.outputs.auth_tag }}
           OCR_TAG: ${{ steps.current.outputs.ocr_tag }}
         run: |
           set -euo pipefail
@@ -293,13 +270,9 @@ jobs:
               printf 'REGISTRY=%s-docker.pkg.dev/%s/%s\n' "$REGION" "$GCP_PROJECT_ID" "$REPOSITORY"
               printf 'API_TAG=%s\n' "$API_TAG"
               printf 'UI_TAG=%s\n' "$UI_TAG"
-              printf 'AUTH_TAG=%s\n' "$AUTH_TAG"
               printf 'OCR_TAG=%s\n' "$OCR_TAG"
               printf "APP_DB_PASSWORD='%s'\n" "$APP_DB_PASSWORD"
-              printf "KC_DB_PASSWORD='%s'\n" "$KC_DB_PASSWORD"
               printf "OCR_DB_PASSWORD='%s'\n" "$OCR_DB_PASSWORD"
-              printf "KC_ADMIN='%s'\n" "$KC_ADMIN"
-              printf "KC_ADMIN_PASSWORD='%s'\n" "$KC_ADMIN_PASSWORD"
               printf "KEYCLOAK_ADMIN_CLIENT_SECRET='%s'\n" "$KEYCLOAK_ADMIN_CLIENT_SECRET"
               printf "PLANELYX_PROVISIONING_SECRET='%s'\n" "$PLANELYX_PROVISIONING_SECRET"
               printf 'OCR_LLM_ENABLED=%s\n' "${OCR_LLM_ENABLED:-false}"
@@ -309,7 +282,6 @@ jobs:
               printf 'API_LOG_LEVEL=%s\n' "${API_LOG_LEVEL:-INFO}"
               printf 'API_LOG_LEVEL_ROOT=%s\n' "${API_LOG_LEVEL_ROOT:-INFO}"
               printf 'OCR_LOG_LEVEL=%s\n' "${OCR_LOG_LEVEL:-info}"
-              printf 'AUTH_LOG_LEVEL=%s\n' "${AUTH_LOG_LEVEL:-info}"
           )
 
           printf '%s\n' "$rendered" \
@@ -362,7 +334,7 @@ jobs:
                   || { echo "error: planelyx-ocr migrations failed; the stack was not touched" >&2; exit 1; }
           fi
 
-          if (( ${#services[@]} == 4 )); then
+          if (( ${#services[@]} == 3 )); then
               docker compose -f "$COMPOSE" up -d --wait --wait-timeout "$wait_timeout" --remove-orphans \
                   || { dump_logs; exit 1; }
           else
@@ -414,18 +386,6 @@ jobs:
                   echo "ui: $PUBLIC_URL/ui/ serves 200"
               else
                   echo "::error::ui: $PUBLIC_URL/ui/ did not return 200."
-                  fail=1
-              fi
-          fi
-
-          if [[ " $SELECTED " == *" auth "* ]]; then
-              want="$PUBLIC_URL/auth/realms/planelyx"
-              got=$(curl -fsS --retry 5 --retry-delay 3 \
-                  "$PUBLIC_URL/auth/realms/planelyx/.well-known/openid-configuration" | jq -r '.issuer') || got=""
-              if [[ $got == "$want" ]]; then
-                  echo "auth: issuer is $got"
-              else
-                  echo "::error::auth: issuer is '${got:-unreachable}', expected '$want'."
                   fail=1
               fi
           fi
@@ -489,7 +449,6 @@ jobs:
           CARRIED: ${{ steps.current.outputs.carried }}
           API_TAG: ${{ steps.current.outputs.api_tag }}
           UI_TAG: ${{ steps.current.outputs.ui_tag }}
-          AUTH_TAG: ${{ steps.current.outputs.auth_tag }}
           OCR_TAG: ${{ steps.current.outputs.ocr_tag }}
         run: |
           set -euo pipefail
@@ -498,7 +457,7 @@ jobs:
               echo
               echo "| Service | Tag | |"
               echo "|---|---|---|"
-              for svc in api ui auth ocr; do
+              for svc in api ui ocr; do
                   upper=${svc^^}
                   tag_var="${upper}_TAG"
                   tag=${!tag_var:-—}

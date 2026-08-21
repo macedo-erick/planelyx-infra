@@ -31,6 +31,23 @@ carrying the realm export and login theme.
 > the deploy does that explicitly — and it is the only container holding state of its own, in
 > volumes whose encryption key nothing can regenerate.
 >
+> **Keycloak left this stack on 2026-08-21**, so the phases below still describe it as one
+> service among four. It moved to `auth` — its own repo, its own Compose project
+> (`~/auth`, network `172.21.0.0/16`, port 8085) and its own deploy workflow — because it is now
+> shared across products rather than owned by Planelyx.
+>
+> **The issuer did not change.** Keycloak still serves Planelyx at `https://planelyx.com/auth`,
+> and `https://planelyx.com/auth/realms/planelyx` is still the string every token carries. What
+> changed is that `KC_HOSTNAME` is now unset with `KC_HOSTNAME_STRICT=false`, so Keycloak builds
+> its URLs from the hostname each request arrived on — that is what lets one server serve a realm
+> per product, each under its product's own domain. The new obligation that follows is in "The
+> central constraint" below.
+>
+> Where this runbook is now out of date: Phase 1 in full, the `auth` service in Phase 7's
+> `compose.prod.yaml`, `AUTH_TAG` and the Keycloak credentials in Phase 8's workflow, and the
+> `keycloak` database line in Phase 5. `auth/VPS_SETUP.md` is the current
+> document for all of it.
+>
 > It is also the only service that can send data off the box. Reading a statement the
 > coordinate parser cannot claim is delegated to Anthropic, gated behind `OCR_LLM_ENABLED`,
 > which defaults to `false` — the model is off until deliberately switched on, and the flag,
@@ -82,9 +99,24 @@ and the API container must both use that same URL. Under path-based routing that
 https://planelyx.com/auth/realms/planelyx
 ```
 
-`KC_HTTP_RELATIVE_PATH`, `KC_HOSTNAME`, the nginx `location /auth/` block, and the
-`extra_hosts` entry on the API container all exist to make that one string true from every
-vantage point. Get it wrong and every authenticated request 401s.
+`KC_HTTP_RELATIVE_PATH`, the nginx `location /auth/` block, and the `extra_hosts` entry on the
+API container all exist to make that one string true from every vantage point. Get it wrong and
+every authenticated request 401s.
+
+**Since the auth split, that string is derived from the `Host` header.** Keycloak runs with no
+fixed hostname so that one server can serve a realm per product, each on its product's own
+domain — which means whatever `Host` reaches it *becomes* the issuer, and the base URL of every
+password-reset link. The `location /auth/` block must therefore include
+`snippets/keycloak-proxy.conf`, which sets `Host` and `X-Forwarded-Host` to `$server_name`,
+and never the general-purpose proxy snippet that forwards the client's own value. It is a
+complete set of headers rather than an overlay, so it replaces that snippet rather than
+following it. A request
+carrying a forged `Host` must not produce an issuer that mentions it:
+
+```bash
+curl -s -H 'Host: forged.example' \
+  https://planelyx.com/auth/realms/planelyx/.well-known/openid-configuration | jq -r .issuer
+```
 
 ---
 
@@ -96,19 +128,22 @@ Two new repos join the existing two:
 |---|---|---|
 | `planelyx-api` (exists) | Spring Boot | image `api` |
 | `planelyx-ui` (exists) | Angular | image `ui` (nginx + static) |
-| `planelyx-auth` (**new**) | Keycloak Dockerfile, `realm-export.json`, `themes/planelyx/`, `spi/` (the `planelyx-provisioning` event listener) | image `auth` |
+| `auth` (**new**, was `planelyx-auth`) | Keycloak Dockerfile, `realms/`, `themes/`, `spi/` (the `planelyx-provisioning` event listener), and since the auth split its own `compose.prod.yaml`, nginx vhost and deploy workflow | image `keycloak`, in the `auth` Artifact Registry repository |
 | `planelyx-infra` (**new**) | `compose.prod.yaml`, nginx site config, `.env.example`, `deploy.yml` | no image — ships `compose.prod.yaml` to the VPS and runs the deploy |
 
-`planelyx-auth` took over `planelyx-api/docker/keycloak/` (both the realm export and the
+The auth repo took over `planelyx-api/docker/keycloak/` (both the realm export and the
 theme). The API repo's `docker/` directory keeps only `postgres/init-keycloak-db.sql`.
 
 **Since 2026-08-06 this is a full move, not a copy.** `planelyx-api/docker/keycloak/` has been
 deleted, and `planelyx-api/compose.yaml` builds the auth image with
-`build: { context: ../planelyx-auth }` rather than pulling `quay.io/keycloak/keycloak:26.0`.
-Local development therefore runs the same image production does, and planelyx-auth is the only
-place Keycloak is configured. Two knock-on effects: local Keycloak now serves under `/auth`
-(the baked `KC_HTTP_RELATIVE_PATH`), and planelyx-api requires planelyx-auth checked out as a
+`build: { context: ../auth }` rather than pulling `quay.io/keycloak/keycloak:26.0`.
+Local development therefore runs the same image production does, and the auth repo is the only
+place Keycloak is configured. Two knock-on effects: local Keycloak serves under `/auth`
+(the baked `KC_HTTP_RELATIVE_PATH`), and planelyx-api requires the auth repo checked out as a
 sibling directory.
+
+**Since 2026-08-21 it is no longer Planelyx's to deploy.** The repo carries its own Compose
+stack and deploy workflow, and serves every product's realm.
 
 > Both git remotes still point at `fintrack-api` / `fintrack-ui`. Renaming is optional and
 > orthogonal — but if you want it, do it *before* wiring CI, not after. (The env vars are
@@ -116,83 +151,23 @@ sibling directory.
 
 ---
 
-## Phase 1 — `planelyx-auth` (new repo)
+## Phase 1 — Keycloak
 
-### `planelyx-auth/Dockerfile`
+**Moved out of this runbook.** Keycloak lives in `auth`, which carries its own
+`README.md` and `VPS_SETUP.md`. Everything that used to be here — the Dockerfile and why the
+build-time options must be baked rather than passed at runtime, the realm export and its
+first-boot-only import, the `firstName`/`lastName` trap in Keycloak 26 — is there, current, and
+covers every product's realm rather than only Planelyx's.
 
-Pinned to **26.0**, matching the version the local `compose.yaml` already runs, so
-production is not simultaneously a version bump. See the file for the full contents.
+The three facts a Planelyx deploy still depends on:
 
-`kc.sh build` bakes in the Postgres provider and the `/auth` relative path so runtime
-startup is fast and `--optimized` is safe.
-
-Production mode **caches themes**, unlike the `start-dev` used locally — theme edits now
-require an image rebuild.
-
-### ⚠️ Build-time options must be baked, not passed at runtime
-
-`KC_DB`, `KC_HEALTH_ENABLED`, `KC_HTTP_RELATIVE_PATH` and
-`KC_HTTP_MANAGEMENT_RELATIVE_PATH` are **build-time** options. With `start --optimized`,
-supplying a *different* value at runtime does not override it — Keycloak prints
-
-```
-The following build time options have values that differ from what is persisted -
-the new values will NOT be used until another build is run
-```
-
-and **exits 2**. It is a hard startup failure, not a warning. This was caught by booting
-the image; the plan's original `compose.prod.yaml` set
-`KC_HTTP_MANAGEMENT_RELATIVE_PATH` at runtime and would have failed on the very first
-boot.
-
-They therefore live in the builder stage `ENV` and are deliberately absent from
-`compose.prod.yaml`. `KC_HTTP_MANAGEMENT_RELATIVE_PATH=/` is the one that matters: without
-it the management interface inherits `/auth` and the health probe moves to
-`:9000/auth/health/ready`.
-
-### `planelyx-auth/realm/realm-export.json`
-
-Originally derived from `planelyx-api/docker/keycloak/realm-export.json` — now the only copy,
-since that file was deleted and local dev imports this one. It differs from the original in
-three ways:
-
-- `"sslRequired": "none"` → `"external"`
-- the seeded `demo` / `Demo@Fintrack1` user is **removed** — otherwise it is a live
-  credential on the public internet
-- redirect URIs are driven by a **new** variable so one file serves both environments:
-
-| Variable | Local | Production | Drives |
-|---|---|---|---|
-| `PLANELYX_UI_ORIGIN` | `http://localhost:4200` | `https://planelyx.com` | `webOrigins` — a CORS origin, rejects a path |
-| `PLANELYX_UI_BASE_URL` | `http://localhost:4200` | `https://planelyx.com/ui` | `rootUrl`, `redirectUris`, post-logout — includes the base path |
-
-The split exists because `webOrigins` must be a bare origin while redirect URIs must carry
-the `/ui` prefix. Using one variable for both cannot express that.
-
-Verified against a running Keycloak: `redirect_uri=https://planelyx.com/ui/` is
-accepted, and `redirect_uri=https://planelyx.com/dashboard` is rejected with
-`Invalid parameter: redirect_uri` — which is exactly the failure the Angular
-`prepareExternalUrl` fix in Phase 2 prevents.
-
-### ⚠️ Realm import is first-boot only
-
-`--import-realm` is a **no-op if the realm already exists** in the `keycloak` database. The
-env-var substitution above only ever happens on that first import. Every later realm change
-must go through the admin console or `kcadm.sh` — from then on the JSON file is
-documentation, not the source of truth.
-
-Plan the first boot carefully. It is the one cheap chance to get the realm right.
-
-### ⚠️ Registration must collect first and last name
-
-Keycloak 26's declarative user profile marks `firstName` and `lastName` required. A user
-missing them cannot obtain a token **at all** — the token endpoint returns
-`{"error":"invalid_grant","error_description":"Account is not fully set up"}` while
-`requiredActions` reads as an empty list, which makes it hard to diagnose from the admin
-console.
-
-The custom `register.ftl` must collect both fields. Confirm this by registering a genuinely
-new user through the browser during verification, not by creating one via `kcadm`.
+- The issuer is `https://planelyx.com/auth/realms/planelyx`, unchanged, and `api` and `ocr`
+  validate against it. See "The central constraint" above for the `Host`-header obligation that
+  now underpins it.
+- `KEYCLOAK_SERVER_URL` points at `https://auth.macedosoftware.com/auth` — the Admin API is not
+  served on the product domain, which returns 404 for `/auth/admin/`.
+- `KEYCLOAK_ADMIN_CLIENT_SECRET` and `PLANELYX_PROVISIONING_SECRET` exist as secrets in **both**
+  repositories, and nothing checks the two copies agree.
 
 ---
 
@@ -488,8 +463,12 @@ listen_addresses = 'localhost,172.20.0.1'
 ```conf
 # pg_hba.conf — subnet must match compose.prod.yaml
 host  planelyx  planelyx_app  172.20.0.0/16  scram-sha-256
-host  keycloak  keycloak      172.20.0.0/16  scram-sha-256
+host  keycloak  keycloak      172.21.0.0/16  scram-sha-256
 ```
+
+The `keycloak` line names a **different** subnet because Keycloak is a separate Compose project
+now, on a network of its own. Its own runbook owns that rule; it is repeated here only so the
+file above is not misleading.
 
 Pinning the Compose network to a known subnet (rather than accepting Docker's default
 `172.17.x`) is what makes these rules precise instead of a broad `172.16.0.0/12`.
@@ -543,8 +522,11 @@ The routing block, for reference:
 
   location /ui/   { proxy_pass http://127.0.0.1:8081; include .../planelyx-proxy.conf; }
   location /api/  { proxy_pass http://127.0.0.1:8082; include .../planelyx-proxy.conf; }
-  location /auth/ { proxy_pass http://127.0.0.1:8083; include .../planelyx-proxy.conf;
-                    proxy_buffer_size 128k; proxy_buffers 4 256k; }
+  location /auth/ { proxy_pass http://127.0.0.1:8085; include .../keycloak-proxy.conf; }
+
+  location /auth/admin/       { return 404; }
+  location /internal/keycloak/ { allow 172.21.0.0/16; deny all;
+                                 proxy_pass http://127.0.0.1:8082; }
 
   location /actuator    { return 404; }
   location /v3/api-docs { return 404; }
@@ -555,7 +537,14 @@ The routing block, for reference:
 path — `/api/transactions` arrives at Spring as `/api/transactions`, `/auth/realms/...`
 arrives at Keycloak as `/auth/realms/...`. Both services are configured to *own* their
 prefix, so nothing is stripped or rewritten anywhere. Adding a trailing slash to any
-`proxy_pass` here would silently break all three.
+`proxy_pass` here would silently break all of them.
+
+`/auth/` includes `keycloak-proxy.conf` rather than `planelyx-proxy.conf`: it carries the
+oversized buffers Keycloak's headers need *and* the `Host` pinning described in "The central
+constraint". `/auth/admin/` is 404 because the admin console belongs on
+`auth.macedosoftware.com`. `/internal/keycloak/` is the provisioning callback, reachable only
+from the auth stack's own subnet — it was previously a container-to-container call that never
+touched nginx at all.
 
 The API's controllers are all mapped under `/api/*` and no `context-path` is set, so `/api/`
 needs no special handling. Swagger, however, lives at the root (`/v3/api-docs`,
@@ -619,16 +608,18 @@ Phase 1). Setting a differing value here makes `start --optimized` exit 2 on boo
 **`KC_BOOTSTRAP_ADMIN_*`.** Keycloak 26 renamed `KEYCLOAK_ADMIN` / `KEYCLOAK_ADMIN_PASSWORD`;
 the old names in the local `compose.yaml` are deprecated. These apply on first boot only.
 
-**The API healthcheck lives in the image**, not here, so `docker run` gets it too. Only
-`auth` declares one in compose, and its probe greps for `200 OK` — a bare `/dev/tcp`
-connection succeeds as soon as the port is open, which would mark Keycloak healthy well
-before the realm is actually ready.
+**The API healthcheck lives in the image**, not here, so `docker run` gets it too. Keycloak
+declares its own in the auth repo's compose file, where the probe greps for `200 OK` — a bare
+`/dev/tcp` connection succeeds as soon as the port is open, which would mark Keycloak healthy
+well before the realm is actually ready.
 
 ### `.env` on the VPS (chmod 600, never committed)
 
-Keys: `REGISTRY`, `API_TAG`, `UI_TAG`, `AUTH_TAG` (pinned SHAs), `APP_DB_PASSWORD`,
-`KC_DB_PASSWORD`, `KC_ADMIN`, `KC_ADMIN_PASSWORD`. Ship a `.env.example` with the keys and no
-values.
+Keys: `REGISTRY`, `API_TAG`, `UI_TAG`, `OCR_TAG` (pinned SHAs), `APP_DB_PASSWORD`,
+`OCR_DB_PASSWORD`, `KEYCLOAK_ADMIN_CLIENT_SECRET`, `PLANELYX_PROVISIONING_SECRET`. Ship a
+`.env.example` with the keys and no values. The Keycloak credentials moved to the auth repo's
+own `.env`; the last two above stay because the API needs them, and are the pair held in both
+repositories.
 
 ⚠️ Every credential in the current `.env.example` (`planelyx`/`planelyx`, `admin`/`admin`)
 must be regenerated. None of them may survive to production.
@@ -686,9 +677,13 @@ common mistake, not a safety net.)
 **Deploying a subset needs two Compose behaviours that are easy to get backwards.** An empty
 service list means *all services*, so "deploy nothing" would silently mean "deploy
 everything" — guarded in the validation step and again in the remote script. And `--no-deps` drops
-dependency edges outright, not merely to services outside the selection: `up --no-deps ui api
-auth` would start `api` without waiting for `auth` to be healthy, and the API resolves the
-OIDC metadata at startup. So selecting all three deliberately takes the whole-stack path.
+dependency edges outright, not merely to services outside the selection. So selecting every
+service deliberately takes the whole-stack path.
+
+Since the auth split there is no dependency edge to Keycloak left to drop — it is a different
+Compose project. The API still resolves its OIDC metadata at startup, so after a host reboot it
+restart-loops until the auth stack is healthy, and `restart: unless-stopped` is what resolves
+that.
 
 **Credentials in GitHub means drift is an outage waiting.** Sourcing `.env` from repo secrets
 was a deliberate choice, and its sharp edge is deferred failure: if `APP_DB_PASSWORD` there
@@ -706,7 +701,8 @@ dotenv parser is not a shell, so single quotes admit no escape at all and a valu
 --wait-timeout 300`, which exits non-zero unless everything it touched reaches
 `running|healthy`. It previously ended on `docker compose ps` and returned 0 regardless, so a
 container in a restart loop read as a successful deploy. 300s is a floor, not a guess —
-`auth`'s healthcheck alone allows 45s + 20×10s. `ui` declares no healthcheck, so `--wait`
+Keycloak's healthcheck alone allowed 45s + 20×10s when it was still in this stack. `ui`
+declares no healthcheck, so `--wait`
 settles for `running` there; the restart counter is re-checked after a dwell, which is the
 only signal separating "started" from "crash-looping". Phase 9 moved all of this into the
 workflow unchanged.
@@ -768,8 +764,9 @@ start until the realm exists.
 6. `.env` and `compose.prod.yaml` on the VPS with those SHAs;
    `docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300`. This is the only
    hand-run deploy — everything after cutover goes through the workflow.
-7. **Watch `docker compose logs -f auth`** and confirm the realm import ran. If the realm is
-   wrong, the cheapest fix *right now* is
+7. **Bring the auth stack up first and watch its log** — it is a separate Compose project now,
+   deployed from `auth`, and `api` will restart-loop until it answers. Confirm
+   the realm import ran. If the realm is wrong, the cheapest fix *right now* is
    `DROP DATABASE keycloak; CREATE DATABASE keycloak OWNER keycloak;` and restart. Once real
    users exist, that door is closed.
 8. Confirm `api` reaches `healthy`. Flyway runs in-process on startup and
@@ -886,8 +883,11 @@ databases live on the host, so nothing should be lost.
   restore. Because `owner_id` ties app rows to Keycloak `sub` values, a partial restore is a
   data-loss event.
 - **Realm-change workflow.** Since `--import-realm` won't re-import, decide now: admin console
-  by hand, or a `kcadm.sh` bootstrap script in `planelyx-auth`. Otherwise the export drifts
+  by hand, or a `kcadm.sh` bootstrap script in the auth repo. Otherwise the export drifts
   from reality within weeks.
+- **The shared-secret pair.** `KEYCLOAK_ADMIN_CLIENT_SECRET` and `PLANELYX_PROVISIONING_SECRET`
+  now live as secrets in two repositories with nothing checking they agree. A drift check that
+  spans repos, or moving both into one place both workflows can read, would close that.
 - ~~**The duplicated Keycloak theme.**~~ **Done (2026-08-06).** They did drift — a change made
   in one was forgotten in the other. `planelyx-api/docker/keycloak/` was deleted and local
   `compose.yaml` now builds the `auth` image, so realm, theme and the Keycloak provider exist

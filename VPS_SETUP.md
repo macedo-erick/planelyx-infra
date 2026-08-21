@@ -44,6 +44,13 @@ the ordering and the traps are the same everywhere.
 One VPS, one hostname, six moving parts. Four of them are containers; two more (nginx and
 PostgreSQL) are installed directly on the host.
 
+**Keycloak is one of the four but is not deployed from this repo.** It is shared across products
+and lives in `auth`, as its own Compose project (`~/auth`, network
+`172.21.0.0/16`, port 8085) with a runbook of its own. It still serves Planelyx at
+`https://planelyx.com/auth` and the issuer is unchanged, so it appears below wherever this host
+depends on it — and everything about building, deploying or configuring it is in
+`auth/VPS_SETUP.md`.
+
 ```
                                   internet
                                      │
@@ -54,25 +61,29 @@ PostgreSQL) are installed directly on the host.
                            └─────────┬─────────┘
         ┌────────────────────┬───────┴────────────┬────────────────────┐
         │                    │                    │                    │
-   /ui/ │              /api/ │              /auth/│               /ocr/│
+   /ui/ │              /api/ │               /ocr/│              /auth/│
         ▼                    ▼                    ▼                    ▼
-  127.0.0.1:8081       127.0.0.1:8082       127.0.0.1:8083       127.0.0.1:8084
+  127.0.0.1:8081       127.0.0.1:8082       127.0.0.1:8084       127.0.0.1:8085
   ┌──────────┐         ┌──────────┐         ┌──────────┐         ┌──────────┐
-  │    ui    │         │   api    │         │   auth   │         │   ocr    │
-  │  nginx + │         │  Spring  │         │ Keycloak │         │  Fastify │
-  │  Angular │         │   Boot   │         │   26.0   │         │ Node 24  │
+  │    ui    │         │   api    │         │   ocr    │         │ keycloak │
+  │  nginx + │         │  Spring  │         │  Fastify │         │   26.0   │
+  │  Angular │         │   Boot   │         │  Node 24 │         │          │
   └──────────┘         └────┬─────┘         └────┬─────┘         └────┬─────┘
                             │                    │                    │
-                            │         docker compose network 172.20.0.0/16
-                            └────────────────────┼────────────────────┘
-                                                 ▼
-                                      ┌────────────────────┐
-                                      │ PostgreSQL (host)  │
-                                      │  db: planelyx      │
-                                      │  db: keycloak      │
-                                      │  db: planelyx_ocr  │
-                                      └────────────────────┘
+                    project `planelyx` 172.20.0.0/16          project `auth`
+                            └────────────────────┤            172.21.0.0/16
+                                                 │                    │
+                                                 ▼                    ▼
+                                      ┌────────────────────────────────────┐
+                                      │        PostgreSQL (host)           │
+                                      │  db: planelyx      db: keycloak    │
+                                      │  db: planelyx_ocr                  │
+                                      └────────────────────────────────────┘
 ```
+
+The two Compose projects are separate networks, so `api` and `ocr` reach Keycloak the same way
+the browser does — through host nginx, via the `extra_hosts` host-gateway entries. There is no
+container-to-container path between them.
 
 `ocr` is the only container holding state of its own: the uploaded statements, encrypted, in a
 Docker volume — plus the key that decrypts them in a second volume. Everything under
@@ -85,8 +96,11 @@ Routing, for reference:
 https://planelyx.com/       →  302 to /ui/
 https://planelyx.com/ui/    →  Angular SPA
 https://planelyx.com/api/   →  Spring Boot
-https://planelyx.com/auth/  →  Keycloak
+https://planelyx.com/auth/  →  Keycloak            (the `auth` stack)
 https://planelyx.com/ocr/   →  statement ingestion (Fastify)
+
+https://planelyx.com/internal/keycloak/  →  the API, from the auth stack's subnet only
+https://planelyx.com/auth/admin/         →  404; the console is on auth.macedosoftware.com
 ```
 
 ### Why nginx and Postgres live on the host
@@ -277,11 +291,15 @@ $ sudo ufw allow from 172.20.0.0/16 to any port 5432 proto tcp \
 $ sudo ufw reload
 ```
 
-Scoped to the Compose subnet, so 5432 stays closed to everything else. Skip this and `auth`
+Scoped to the Compose subnet, so 5432 stays closed to everything else. Skip this and `api`
 fails to start with a **timeout** — never a refusal, never an authentication error, because
 the packets are silently discarded rather than answered. See [§16](#16-troubleshooting) for
 how to tell those apart, and keep the rule's subnet in step with the `ipam` block in
 `compose.prod.yaml`.
+
+**This rule covers only this stack.** The auth stack's containers come from `172.21.0.0/16`
+and need a rule of their own; `auth/VPS_SETUP.md` §2 owns it. Every new Compose project on
+this box needs one, and the failure mode is always this same silent timeout.
 
 This rule is **load-bearing, not defence in depth**: [§7](#7-postgresql) binds Postgres to
 `'*'` deliberately, so ufw and `pg_hba.conf` are what keep the database off the internet.
@@ -469,6 +487,7 @@ CREATE DATABASE planelyx OWNER planelyx_app;
 
 CREATE ROLE keycloak LOGIN PASSWORD '<kc-password>';
 CREATE DATABASE keycloak OWNER keycloak;
+-- keycloak's role and database belong to the auth stack; see auth/VPS_SETUP.md §2
 
 CREATE ROLE planelyx_ocr LOGIN PASSWORD '<ocr-password>';
 CREATE DATABASE planelyx_ocr OWNER planelyx_ocr;
@@ -532,14 +551,21 @@ listen_addresses = '*'
 `/etc/postgresql/17/main/pg_hba.conf` — append at the end:
 
 ```conf
-# Compose containers. The subnet must match the ipam block in compose.prod.yaml.
+# Compose containers. Each subnet must match the ipam block in that stack's compose file.
 host  planelyx      planelyx_app  172.20.0.0/16  scram-sha-256
-host  keycloak      keycloak      172.20.0.0/16  scram-sha-256
 host  planelyx_ocr  planelyx_ocr  172.20.0.0/16  scram-sha-256
+host  keycloak      keycloak      172.21.0.0/16  scram-sha-256
 ```
 
 Pinning the Compose subnet (rather than accepting whatever `172.17.x` Docker hands out) is
 precisely what lets these rules be narrow instead of a shrug-shaped `172.16.0.0/12`.
+
+**The `keycloak` line names a different subnet on purpose.** It is a separate Compose project
+with a network of its own, and a rule naming `172.20.0.0/16` would leave Keycloak unable to
+reach its database — as an immediate `FATAL: no pg_hba.conf entry for host "172.21.0.2"`. That
+is the *easy* failure: it names the address that was refused. The silent one is the matching
+`ufw` rule ([§4](#4-firewall)), which drops the packets so nothing is logged here at all. `auth/VPS_SETUP.md` §2
+owns that rule; it is here so this file is not misleading.
 
 **`pg_hba.conf` is first-match-wins, top to bottom.** Appending is safe here because
 Ubuntu's default file contains nothing matching `172.20.x`. If you have added a broad
@@ -834,6 +860,15 @@ $ sudo nginx -t && sudo systemctl reload nginx
 so the site keeps working and you find out at the next restart — possibly a reboot, weeks
 later.
 
+`/auth/` depends on `snippets/keycloak-proxy.conf`, which the **auth** repo installs. If it is
+not on the box yet, `nginx -t` fails on the include and this reload will not happen — do
+`auth/VPS_SETUP.md` §4 first. That snippet is not cosmetic: it sets `Host`
+and `X-Forwarded-Host` to `$server_name`, and Keycloak derives the issuer from those headers.
+Including the general-purpose `planelyx-proxy.conf` here instead would forward the client's own
+`Host`, and a forged one would end up in the issuer and in password-reset links. It carries a
+full set of proxy headers, so it replaces `planelyx-proxy.conf` in that location rather than
+being added to it.
+
 The routing this installs, for reference:
 
 ```nginx
@@ -841,10 +876,13 @@ location = / { return 302 /ui/; }
 
 location /ui/   { proxy_pass http://127.0.0.1:8081; include .../planelyx-proxy.conf; }
 location /api/  { proxy_pass http://127.0.0.1:8082; include .../planelyx-proxy.conf; }
-location /auth/ { proxy_pass http://127.0.0.1:8083; include .../planelyx-proxy.conf;
-                  proxy_buffer_size 128k; proxy_buffers 4 256k; }
+location /auth/ { proxy_pass http://127.0.0.1:8085; include .../keycloak-proxy.conf; }
 location /ocr/  { proxy_pass http://127.0.0.1:8084; include .../planelyx-proxy.conf;
                   client_max_body_size 25m; proxy_read_timeout 120s; }
+
+location /auth/admin/        { return 404; }
+location /internal/keycloak/ { allow 172.21.0.0/16; deny all;
+                               proxy_pass http://127.0.0.1:8082; }
 
 location /actuator    { return 404; }
 location /v3/api-docs { return 404; }
@@ -979,20 +1017,23 @@ $ nano .env
 | Key | Value |
 |---|---|
 | `REGISTRY` | `southamerica-east1-docker.pkg.dev/PROJECT_ID/docker-remote-repo` |
-| `API_TAG` / `UI_TAG` / `AUTH_TAG` / `OCR_TAG` | the commit SHAs from the four green CI runs |
+| `API_TAG` / `UI_TAG` / `OCR_TAG` | the commit SHAs from the three green CI runs |
 | `APP_DB_PASSWORD` | the `planelyx_app` password from [§7](#7-postgresql) |
-| `KC_DB_PASSWORD` | the `keycloak` password from [§7](#7-postgresql) |
 | `OCR_DB_PASSWORD` | the `planelyx_ocr` password from [§7](#7-postgresql) |
-| `KC_ADMIN` / `KC_ADMIN_PASSWORD` | freshly generated |
+| `KEYCLOAK_ADMIN_CLIENT_SECRET` | the `planelyx-api-admin` client secret, read out of Keycloak |
+| `PLANELYX_PROVISIONING_SECRET` | the same value the auth stack's `.env` carries |
+
+Keycloak's own `.env` lives in `~/auth`, written by `auth`'s deploy workflow.
 
 Two rules, both worth being pedantic about:
 
-- **`REGISTRY` must match what CI pushed to.** All four `release.yml` workflows use
-  `REPOSITORY: planelyx`, which is also what `deploy.yml` renders into `.env` from
-  [§13](#13-the-deploy-workflow) onwards. Point `REGISTRY` anywhere else and the pull hits a
-  path that has never been written to.
+- **`REGISTRY` must match what CI pushed to.** The three `release.yml` workflows in this
+  stack's repos use `REPOSITORY: planelyx`, which is also what `deploy.yml` renders into `.env`
+  from [§13](#13-the-deploy-workflow) onwards. Point `REGISTRY` anywhere else and the pull hits
+  a path that has never been written to. The Keycloak image is in a repository of its own,
+  `auth`, and the auth stack's `.env` names it.
 - **Pin SHAs, never `latest`.** `latest` makes a redeploy non-reproducible and turns
-  rollback into guesswork. With SHAs pinned, rollback is editing four lines.
+  rollback into guesswork. With SHAs pinned, rollback is editing three lines.
 
 Every credential must be freshly generated. None of the local development values
 (`planelyx`/`planelyx`, `admin`/`admin`) may reach this file.
@@ -1017,9 +1058,9 @@ recommends it. If a password manager produced one that has a `$`, all three of t
 behave differently, verified against a running container:
 
 ```bash
-KC_DB_PASSWORD=Ab$jiBybu6hWhVy6V4cd      # container receives  Ab          ✗ truncated
-KC_DB_PASSWORD=Ab$$jiBybu6hWhVy6V4cd     # container receives  Ab$jiBy…cd  ✓ escaped
-KC_DB_PASSWORD='Ab$jiBybu6hWhVy6V4cd'    # container receives  Ab$jiBy…cd  ✓ quoted
+APP_DB_PASSWORD=Ab$jiBybu6hWhVy6V4cd     # container receives  Ab          ✗ truncated
+APP_DB_PASSWORD=Ab$$jiBybu6hWhVy6V4cd    # container receives  Ab$jiBy…cd  ✓ escaped
+APP_DB_PASSWORD='Ab$jiBybu6hWhVy6V4cd'   # container receives  Ab$jiBy…cd  ✓ quoted
 ```
 
 Single-quoting is the least error-prone: the value stays readable and matches what you typed
@@ -1030,7 +1071,7 @@ into `psql`. With `$$`, remember the value stored in Postgres is the **unescaped
 
 ```bash
 $ docker compose -f compose.prod.yaml run --rm api printenv POSTGRES_PASSWORD
-$ docker compose -f compose.prod.yaml run --rm auth printenv KC_DB_PASSWORD
+$ docker compose -f compose.prod.yaml run --rm ocr printenv POSTGRES_PASSWORD
 ```
 
 > ⚠️ **Do not use `docker compose config` for this check.** It re-escapes `$` as `$$` in its
@@ -1047,43 +1088,27 @@ $ docker compose -f compose.prod.yaml up -d --wait --wait-timeout 300 --remove-o
 
 `--wait` blocks until every service is running or healthy and exits non-zero otherwise;
 `--wait-timeout` is mandatory, because without it `--wait` waits forever. 300s is a floor
-rather than a guess: `auth`'s healthcheck allows a 45s start period plus 20 retries at 10s,
-and `api` runs Flyway before it reports healthy.
+rather than a guess: `api` runs Flyway before it reports healthy.
 
 This is the only time you run these by hand. From [§13](#13-the-deploy-workflow) onward the
 deploy workflow issues the same two commands over SSH.
 
-Startup ordering is not incidental. `api` declares `depends_on: auth: service_healthy`, so:
+### ⚠️ Bring the auth stack up first
 
-1. `auth` starts, connects to the `keycloak` database, and — because the database is empty —
-   **imports the realm**.
-2. `auth` reports healthy once `/health/ready` returns `200 OK` on port 9000.
-3. `api` starts, runs Flyway against `planelyx`, and fetches JWKS from the issuer URL.
+Keycloak is a separate Compose project and there is no `depends_on` edge to it. `api` resolves
+its OIDC metadata eagerly at startup, so if the auth stack is not answering, `api` fails to
+start and restart-loops until it is. That resolves itself — `restart: unless-stopped` keeps
+retrying — but on a first boot it reads like an API problem when it is not one.
 
-### ⚠️ Watch the first boot of `auth`
-
-```bash
-$ docker compose -f compose.prod.yaml logs -f auth
-```
-
-You are looking for a line reporting the `planelyx` realm being imported.
-
-**`--import-realm` is a no-op once the realm exists.** The environment substitutions in
-`realm-export.json` — `PLANELYX_UI_ORIGIN` and `PLANELYX_UI_BASE_URL` — are resolved *only*
-on that first import. From then on the JSON file is documentation, and every realm change
-must go through the admin console or `kcadm.sh`.
-
-This makes the first boot the one cheap chance to get the realm right. If it imported with
-the wrong values, fix it **now**:
+Deploy the auth stack first, per `auth/VPS_SETUP.md` §7, and confirm:
 
 ```bash
-$ docker compose -f compose.prod.yaml stop auth
-$ sudo -u postgres psql -c 'DROP DATABASE keycloak;'
-$ sudo -u postgres psql -c 'CREATE DATABASE keycloak OWNER keycloak;'
-$ docker compose -f compose.prod.yaml up -d auth
+$ curl -s https://planelyx.com/auth/realms/planelyx/.well-known/openid-configuration | jq -r .issuer
+# https://planelyx.com/auth/realms/planelyx
 ```
 
-Once real users exist, that door is closed and you are editing the realm by hand.
+Then bring this stack up. The first-boot realm import, and the drop-and-recreate escape hatch
+for a realm that imported wrong, are in that document too — this stack has no say in either.
 
 ### Then confirm `api` reaches healthy
 
@@ -1164,13 +1189,20 @@ In `planelyx-infra` → Settings → Secrets and variables → Actions:
 | `VPS_SSH_KNOWN_HOSTS` | the `ssh-keyscan` output above |
 | `GCP_PROJECT_ID` | same value as in the four service repos |
 | `APP_DB_PASSWORD` | the `planelyx_app` role's password, from [§7](#7-postgresql) |
-| `KC_DB_PASSWORD` | the `keycloak` role's password |
 | `OCR_DB_PASSWORD` | the `planelyx_ocr` role's password |
-| `KC_ADMIN` | Keycloak bootstrap admin username |
-| `KC_ADMIN_PASSWORD` | Keycloak bootstrap admin password |
-| `KEYCLOAK_ADMIN_CLIENT_SECRET` | secret of the `planelyx-api-admin` client — **read out of the Keycloak admin console**, not generated |
-| `PLANELYX_PROVISIONING_SECRET` | signs Keycloak's "a user registered" callback to the API; generate with `openssl rand -hex 32` |
+| `KEYCLOAK_ADMIN_CLIENT_SECRET` | secret of the `planelyx-api-admin` client — **read out of the Keycloak admin console**, not generated. Also held by the auth repo |
+| `PLANELYX_PROVISIONING_SECRET` | verifies Keycloak's "a user registered" callback to the API; generate with `openssl rand -hex 32`. Also held by the auth repo |
 | `ANTHROPIC_API_KEY` | **optional** — model escalation for statements the coordinate parser cannot read. Leave unset to keep every document on the machine |
+
+`KC_DB_PASSWORD`, `KC_ADMIN` and `KC_ADMIN_PASSWORD` are **not** here any more — they belong to
+`auth`, which renders its own `.env`. Delete them from this repo once the auth
+stack is live.
+
+The last two rows are the awkward ones: they exist as secrets in **both** repositories, because
+Keycloak holds one side of each and the API the other, and **nothing checks the two copies
+agree**. A mismatched `KEYCLOAK_ADMIN_CLIENT_SECRET` is a 401 on the profile page; a mismatched
+`PLANELYX_PROVISIONING_SECRET` means new users silently get no default categories. Rotating
+either means updating both repositories and redeploying both stacks, back to back.
 
 ### Repo variables (model escalation)
 
@@ -1263,6 +1295,9 @@ nginx is the deliberate exception. Its configs live in `/etc/nginx`, are root-ow
 Run these in order. The ordering is deliberate: each one narrows down where a failure can
 be, and the issuer check catches the single most likely mistake.
 
+The auth stack has verification of its own, in `auth/VPS_SETUP.md` §8. Run that
+first — several checks below assume Keycloak is already answering correctly.
+
 ### 1. The issuer string — the most important check
 
 ```bash
@@ -1322,7 +1357,26 @@ $ docker compose -f compose.prod.yaml exec api \
 ```
 
 A TLS or DNS error here means `extra_hosts` or the certificate is wrong, and every
-authenticated request will 401 until it is fixed. TLS validates correctly despite the
+authenticated request will 401 until it is fixed.
+
+`ocr` needs the same entry, for the same reason — it derives its JWKS URL from the issuer:
+
+```bash
+$ docker compose -f compose.prod.yaml exec ocr \
+    curl -fsS https://planelyx.com/auth/realms/planelyx/protocol/openid-connect/certs \
+    | head -c 120
+```
+
+And `api` needs a second one, `auth.macedosoftware.com`, because the Admin API is not served on
+the product domain:
+
+```bash
+$ docker compose -f compose.prod.yaml exec api \
+    curl -fsS -o /dev/null -w '%{http_code}\n' https://auth.macedosoftware.com/auth/realms/planelyx
+# 200
+```
+
+TLS validates correctly despite the
 redirection because the SNI hostname is genuinely `planelyx.com`.
 
 ### 4. The API's own health
@@ -1412,7 +1466,7 @@ Confirm that from off-box, which is the only test that counts:
 
 ```bash
 # from your workstation, not the VPS
-$ nmap -Pn -p 22,80,443,5432,8081,8082,8083,8084 <VPS public IP>
+$ nmap -Pn -p 22,80,443,5432,8081,8082,8084,8085 <VPS public IP>
 # 22/80/443 open; everything else filtered or closed
 ```
 
@@ -1425,7 +1479,9 @@ $ nmap -Pn -p 22,80,443,5432,8081,8082,8083,8084 <VPS public IP>
 ```bash
 $ cd ~/planelyx-infra
 $ docker compose -f compose.prod.yaml logs -f --tail=100 api
-$ docker compose -f compose.prod.yaml logs -f auth
+$ docker compose -f compose.prod.yaml logs -f ocr
+
+$ cd ~/auth && docker compose -f compose.prod.yaml logs -f keycloak
 
 $ sudo tail -f /var/log/nginx/error.log
 $ sudo tail -f /var/log/postgresql/postgresql-17-main.log
@@ -1688,12 +1744,13 @@ $ sudo reboot        # when the kernel changed
 | **API healthy but 401s**, issuer strings match | API cannot reach the issuer to fetch JWKS. | Run [§14 check 3](#3-the-host-gateway-hairpin). Missing `'planelyx.com:host-gateway'` in `extra_hosts`, or the container cannot reach host nginx on 443. |
 | **`auth` container exits with code 2** on start, log mentions "build time options have values that differ" | A build-time Keycloak option was overridden at runtime. `KC_DB`, `KC_HEALTH_ENABLED`, `KC_HTTP_RELATIVE_PATH` and `KC_HTTP_MANAGEMENT_RELATIVE_PATH` are baked into the image; `start --optimized` treats a differing runtime value as fatal, not a warning. | Remove the offending variable from `compose.prod.yaml`. To actually change it, edit `planelyx-auth/Dockerfile` and rebuild. |
 | **`auth` never becomes healthy**, but the log looks fine | The health probe moved. If `KC_HTTP_MANAGEMENT_RELATIVE_PATH` is not pinned to `/`, the management interface inherits `/auth` and health lands at `:9000/auth/health/ready`. | Confirm the Dockerfile bakes `KC_HTTP_MANAGEMENT_RELATIVE_PATH=/`. |
-| **Compose warns** `The "xxxxx" variable is not set. Defaulting to a blank string` | A value in `.env` contains a literal `$`, which Compose interpolated away. A credential reached the container truncated at the `$`. | Wrap the value in single quotes (or escape as `$$`), then verify with `docker compose run --rm auth printenv KC_DB_PASSWORD` — **not** `docker compose config`, which re-escapes `$`. See [§12](#12-bringing-up-the-stack). |
+| **Compose warns** `The "xxxxx" variable is not set. Defaulting to a blank string` | A value in `.env` contains a literal `$`, which Compose interpolated away. A credential reached the container truncated at the `$`. | Wrap the value in single quotes (or escape as `$$`), then verify with `docker compose run --rm api printenv POSTGRES_PASSWORD` — **not** `docker compose config`, which re-escapes `$`. See [§12](#12-bringing-up-the-stack). |
 | **`auth` fails to start**, log shows `Acquisition timeout while waiting for new connection` / `Could not obtain connection to query metadata` | Keycloak could not get a database connection. Agroal reports the same pool timeout for every underlying cause, so this message alone tells you nothing. | **Read the line below it.** `Datasource '<default>': The connection attempt failed.` means an IOException — the packet went unanswered. An explicit `FATAL:` or `no pg_hba.conf entry` means Postgres replied and rejected you. Then take the matching row below. |
 | ↳ **Hang for ~10s**, then `The connection attempt failed.`; Postgres log is **completely silent** | `ufw` is dropping container→host traffic on 5432. This is the common one, and the silence is the tell — Postgres never saw the packet. | `sudo ufw allow from 172.20.0.0/16 to any port 5432 proto tcp && sudo ufw reload`. Confirm first with `sudo grep 'UFW BLOCK' /var/log/ufw.log \| grep 5432`. See [§4](#4-firewall). |
 | ↳ **Instant** `Connection to host.docker.internal:5432 refused` | Nothing is listening on the bridge gateway. Postgres is up but bound to loopback only. | `sudo ss -tlnp \| grep 5432` — if it shows only `127.0.0.1`, set `listen_addresses = '*'` and **restart** (a reload silently does nothing). Check `sudo -u postgres psql -c 'SHOW config_file;'` too — you may have edited a different cluster's config. |
 | ↳ Postgres log says `password authentication failed for user "keycloak"` | Wrong credential. Most often the `$`-interpolation bug above; otherwise `.env` and the role have drifted. | Fix `.env`, or `sudo -u postgres psql -c "ALTER ROLE keycloak PASSWORD '<new>';"`. Then `docker compose -f compose.prod.yaml up -d auth`. |
-| **`api` reports** `dependency auth failed to start` | Not an API problem. `depends_on: auth: service_healthy` means `api` never started because `auth` did not become healthy. | Debug `auth` first: `docker compose -f compose.prod.yaml logs auth`. `api` will come up on its own once `auth` is healthy. |
+| **`api` restart-loops with an OIDC/JWKS error at startup** | Not an API problem. It resolves `issuer-uri` eagerly and there is no `depends_on` edge to Keycloak any more — the auth stack is a separate Compose project. | Debug the auth stack first: `cd ~/auth && docker compose -f compose.prod.yaml logs keycloak`. `api` comes up on its own once Keycloak answers. |
+| **A password-reset link points at the wrong domain**, or the issuer contains a hostname you did not configure | The `/auth/` location is including `planelyx-proxy.conf` instead of `keycloak-proxy.conf`, so the client's own `Host` header is reaching Keycloak and becoming the issuer. | Fix the include, reload nginx, and re-run the forged-`Host` check in `auth/VPS_SETUP.md` §8. |
 | **Two Postgres clusters**, edits to config have no effect | Ubuntu's `postgresql-16` and PGDG's `postgresql-17` are both installed. 16 holds port 5432; 17 was pushed to 5433. You are editing the config of a server nothing connects to. | `pg_lsclusters`, then `sudo -u postgres psql -c 'SHOW config_file;'` to see which file the running server read. Drop the unwanted cluster with `sudo pg_dropcluster --stop 16 main`. |
 | **Containers reach Postgres but get** `no pg_hba.conf entry for host "172.20.0.x"` | Subnet drift between `compose.prod.yaml` and `pg_hba.conf`, or the rules are below a broader match. | Compare the `ipam` subnet with the `host` lines. `sudo systemctl reload postgresql` after editing. |
 | **PostgreSQL will not start after a reboot**, log says `could not create listen socket for "172.20.0.1"` | `listen_addresses` pins the bridge gateway, but Postgres started before Docker created the bridge. Nothing owns that address yet. | Set `listen_addresses = '*'` — [§7](#7-postgresql) explains why that is the right default and what still keeps 5432 private. As a stopgap, `docker network create --subnet 172.20.0.0/16 planelyx_planelyx` then start Postgres. |
