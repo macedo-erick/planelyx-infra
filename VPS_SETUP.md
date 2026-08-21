@@ -869,6 +869,54 @@ Including the general-purpose `planelyx-proxy.conf` here instead would forward t
 full set of proxy headers, so it replaces `planelyx-proxy.conf` in that location rather than
 being added to it.
 
+### Hand the two files to the deploy user
+
+Everything above is the one-time bootstrap. From here the **deploy workflow owns these two
+files** and rewrites them on every run, so the deploy user needs to be able to write them
+without `sudo`:
+
+```bash
+$ sudo chown "$VPS_USER":"$VPS_USER" /etc/nginx/sites-available/planelyx
+$ sudo chown "$VPS_USER":"$VPS_USER" /etc/nginx/snippets/planelyx-proxy.conf
+$ sudo chmod 644 /etc/nginx/sites-available/planelyx /etc/nginx/snippets/planelyx-proxy.conf
+```
+
+`$VPS_USER` is the SSH user GitHub Actions deploys as. The directories stay root-owned — only
+these two files change hands, so the pipeline can replace them and nothing else in
+`/etc/nginx`.
+
+`snippets/keycloak-proxy.conf` is deliberately **not** in that list. The auth repo owns it,
+and the deploy workflow never writes or deletes it: it copies an explicit list of two files
+rather than syncing the directory. A directory sync here would delete the auth repo's snippet,
+and since `planelyx.conf` includes it, the very next `nginx -t` would fail.
+
+### Sudoers rule
+
+The pipeline needs exactly two privileged commands:
+
+```bash
+$ sudo visudo -f /etc/sudoers.d/planelyx-deploy
+```
+
+```
+<VPS_USER> ALL=(root) NOPASSWD: /usr/sbin/nginx -t, /bin/systemctl reload nginx
+```
+
+Deliberately not blanket `NOPASSWD`: a leaked deploy key then buys a config test and a
+reload, not root. Check the binary paths with `command -v nginx` and `command -v systemctl` —
+they differ across distributions, and a path that does not match is a rule that silently
+never applies.
+
+Verify **as the deploy user**, non-interactively, or the failure surfaces mid-deploy instead:
+
+```bash
+$ sudo -n nginx -t && echo "sudoers rule works"
+```
+
+If the monitoring stack is already on this box it has its own
+`/etc/sudoers.d/monitoring-deploy` with the same two commands. Both files can coexist; if the
+deploy user is the same for both, one rule is enough and the second is a harmless duplicate.
+
 The routing this installs, for reference:
 
 ```nginx
@@ -932,6 +980,47 @@ $ sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 The nginx installer plugin usually handles this, but the hook is idempotent and costs
 nothing. A silently-unreloaded renewal means your site starts serving an expired certificate
 30 days after everything appeared to work.
+
+### Take the vhost away from certbot's installer
+
+⚠️ **Do this once, and do not skip it.** The certificate above was issued with `--nginx`,
+which records `installer = nginx` in the renewal config. That installer *edits the vhost file
+in place*. The deploy workflow now overwrites that same file on every run. Two writers, one
+file: certbot re-adds its managed block, the next deploy wipes it, and the failure surfaces
+60 days later as a renewal that no longer knows where to write — with an expired certificate
+behind it.
+
+Point the renewal at the webroot authenticator and drop the installer:
+
+```bash
+$ sudo cp /etc/letsencrypt/renewal/planelyx.com.conf{,.bak}
+$ sudo sed -i \
+    -e 's/^installer = nginx$/installer = None/' \
+    -e 's/^authenticator = nginx$/authenticator = webroot/' \
+    /etc/letsencrypt/renewal/planelyx.com.conf
+```
+
+Then make sure the `[renewalparams]` section carries the webroot path, adding it if `sed`
+found no `authenticator = nginx` line to rewrite:
+
+```
+webroot_path = /var/www/certbot,
+```
+
+The `:80` server block in `nginx/planelyx.conf` already serves
+`/.well-known/acme-challenge/` from `/var/www/certbot`, so the challenge works without
+touching nginx config at renewal time. The deploy hook above is now what reloads nginx — it
+is no longer redundant with the installer, it is the only thing doing that job.
+
+Verify:
+
+```bash
+$ sudo certbot renew --dry-run
+$ sudo git diff --no-index /etc/nginx/sites-available/planelyx nginx/planelyx.conf
+```
+
+The dry run must pass, and the vhost must still match the repo afterwards. If it does not,
+certbot is still editing it and the installer change did not take.
 
 ---
 
@@ -1281,9 +1370,21 @@ invisible when it happens: forget the pull, and the deploy runs against an older
 while reporting success. There is no pull to forget now, and no way for the running stack to
 lag behind master.
 
-nginx is the deliberate exception. Its configs live in `/etc/nginx`, are root-owned, and need
-`nginx -t` plus a reload, so they stay a manual step — see
-[§11.5](#get-the-config-onto-the-box).
+- **`nginx/planelyx.conf`** and **`nginx/snippets/planelyx-proxy.conf`** — shipped from the
+  same commit, after the containers are up and before the smoke checks.
+
+The nginx step copies an explicit list of two files, compares each against what is live, and
+does nothing at all when they match — so an ordinary release does not reload nginx. When they
+differ it backs the live files up to `~/planelyx-infra/nginx-prev/`, installs the new ones,
+and runs `sudo nginx -t`. **A failed test restores the backups and fails the run without
+reloading**, which matters because this nginx also fronts
+`monitoring.macedosoftware.com`: a broken planelyx config must never reach the shared
+process. The smoke checks then re-request that neighbour hostname to confirm the reload did
+not take it down.
+
+This needs the one-time bootstrap in [§9](#9-nginx) — the two files chowned to the deploy
+user, and the sudoers rule for `nginx -t` and `systemctl reload nginx`. The workflow refuses
+to run if either file is missing or not writable, rather than half-applying a config.
 
 > `workflow_dispatch` only appears in the Actions tab once the workflow file is on the default
 > branch. If you cannot find the "Run workflow" button, the file is still on a feature branch.
@@ -1328,9 +1429,9 @@ $ curl -sI https://planelyx.com/ocr/documents    # 401 — proxied and rejecting
 ```
 
 That last one is the check worth being precise about: **401 is the pass condition.** A 404
-means the `location /ocr/` block is missing from the host nginx config — the containers are
-shipped by the workflow, but nginx is not, so it is the one piece that a deploy cannot install
-for you. A 502 means the container is not up.
+means the `location /ocr/` block is missing from the host nginx config — which now means the
+deploy's nginx step did not run or its `nginx -t` failed and rolled back, so read that step's
+log. A 502 means the container is not up.
 
 The service's own health endpoint is deliberately not reachable from the internet; check it
 from the box:
@@ -1710,6 +1811,29 @@ migration, the old image will start against a newer schema and `ddl-auto: valida
 refuse. Additive migrations (new nullable columns, new tables) are usually safe to roll back
 across; destructive ones are not. Plan schema changes with that asymmetry in mind.
 
+**Rolling back nginx** is a separate thing, because the vhost is not versioned by image tag.
+The workflow already restores automatically when `nginx -t` fails. To undo a config that
+passed the test but behaves wrongly, either re-run the workflow from the previous commit or
+put the backups back by hand:
+
+```bash
+$ cd ~/planelyx-infra
+$ cp nginx-prev/planelyx.conf /etc/nginx/sites-available/planelyx
+$ cp nginx-prev/planelyx-proxy.conf /etc/nginx/snippets/planelyx-proxy.conf
+$ sudo nginx -t && sudo systemctl reload nginx
+```
+
+No `sudo` on the two `cp` lines — those files belong to the deploy user. `nginx-prev/` holds
+only the files that changed on the last run that changed anything, so check the timestamps
+before trusting it as a full snapshot.
+
+To take the site offline without touching the monitoring stack or the auth stack:
+
+```bash
+$ sudo rm /etc/nginx/sites-enabled/planelyx
+$ sudo nginx -t && sudo systemctl reload nginx
+```
+
 ### Disk
 
 ```bash
@@ -1785,8 +1909,10 @@ $ curl -s https://planelyx.com/auth/realms/planelyx/.well-known/openid-configura
 
 ```
 ~/planelyx-infra/                              compose.prod.yaml, .env  (both workflow-managed)
-/etc/nginx/sites-available/planelyx            site config
-/etc/nginx/snippets/planelyx-proxy.conf        shared X-Forwarded-* headers
+/etc/nginx/sites-available/planelyx            site config          (workflow-managed)
+/etc/nginx/snippets/planelyx-proxy.conf        shared X-Forwarded-* headers (workflow-managed)
+/etc/nginx/snippets/keycloak-proxy.conf        Keycloak headers    (auth repo installs this)
+~/planelyx-infra/nginx-prev/                   previous nginx files, for rollback
 /etc/letsencrypt/live/planelyx.com/            certificates
 /etc/postgresql/17/main/postgresql.conf        listen_addresses
 /etc/postgresql/17/main/pg_hba.conf            container access rules

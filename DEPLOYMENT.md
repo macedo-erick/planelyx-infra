@@ -737,10 +737,35 @@ together. So the window where the box holds a new compose file and an old `.env`
 reverse — never opens, and a failed pull still costs a red run and nothing else. Phase 8
 already did this for `.env`; extending it to the compose file was the whole change.
 
-**What is deliberately not shipped:** the nginx configs. They live in `/etc/nginx`, are
-root-owned, and need `nginx -t` plus a reload. Giving the deploy key the sudo rights to
-install them would buy a rarely-used convenience with a permanent increase in what a
-compromised CI credential can do.
+**The nginx configs are shipped too**, as of the nginx step. This reverses an earlier
+decision, so the reasoning that changed is worth recording. The original argument was that
+`/etc/nginx` is root-owned and a reload needs sudo, so automating it would buy a rarely-used
+convenience with a permanent increase in what a compromised CI credential can do.
+
+What made that a bad trade was the failure mode on the other side. A routing change is not
+rare — every new path prefix is one — and when it is the single hand-applied step in an
+otherwise automated release, it is the step that gets forgotten. That failure is silent from
+the workflow's point of view: containers up, deploy green, and a `404` on the new route that
+looks like an application bug. `VPS_SETUP.md` §14 had to carry a troubleshooting entry
+explaining that exact symptom.
+
+The privilege increase is smaller than it first looks, because the pipeline is not given
+write access to `/etc/nginx`. Two named files are chowned to the deploy user; the directories
+stay root-owned. The sudoers rule grants exactly `nginx -t` and `systemctl reload nginx` —
+not blanket `NOPASSWD` — so what a leaked deploy key buys is a config test and a reload of a
+config it could already influence, not root. That is a real increase, and it is bounded.
+
+The dangerous part is not privilege but blast radius: this nginx also fronts
+`monitoring.macedosoftware.com`, so a bad planelyx config would take down a neighbouring
+service. Hence the ordering — compare, back up, install, `nginx -t`, and **restore and fail
+without reloading** if the test fails — plus a smoke check that re-requests the neighbour
+hostname after the reload. An unchanged config reloads nothing at all.
+
+The other constraint is `snippets/keycloak-proxy.conf`, which the auth repo owns and
+`planelyx.conf` includes. The step therefore copies an explicit list of files rather than
+syncing the `nginx/` directory the way the monitoring repo's equivalent step does. A
+directory sync would delete that snippet, and the next `nginx -t` would fail on the dangling
+include — taking `/auth/` down with it.
 
 Reading `.env` on the VPS was the one thing `deploy.sh` did that isn't a Compose command —
 `--read-env-key`, used to carry forward the tags of unselected services and to compare
